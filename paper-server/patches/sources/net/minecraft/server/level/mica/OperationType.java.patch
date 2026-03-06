@@ -1,0 +1,19 @@
+--- /dev/null
++++ b/net/minecraft/server/level/mica/OperationType.java
+@@ -1,0 +_,16 @@
++// ============================================================================
++// 4. OperationType
++// ============================================================================
++
++package net.minecraft.server.level.mica;
++
++public enum OperationType {
++    BLOCK_TICK,
++    FLUID_TICK,
++    RANDOM_TICK,
++    ENTITY_TICK,
++    BLOCK_ENTITY_TICK,
++    CHUNK_TICK,       // ice/snow/lightning
++    MOB_SPAWN,
++    PLAYER_ACTION
++}

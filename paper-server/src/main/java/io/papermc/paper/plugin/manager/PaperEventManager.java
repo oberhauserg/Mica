@@ -38,7 +38,16 @@ class PaperEventManager {
     public void callEvent(@NotNull Event event) {
         if (event.isAsynchronous() && this.server.isPrimaryThread()) {
             throw new IllegalStateException(event.getEventName() + " may only be triggered asynchronously.");
-        } else if (!event.isAsynchronous() && !this.server.isPrimaryThread() && !this.server.isStopping()) {
+        }  else if (!event.isAsynchronous() && !this.server.isPrimaryThread() && !this.server.isStopping()) {
+            // Mica start - buffer sync events during parallel tick processing
+            if (Thread.currentThread() instanceof java.util.concurrent.ForkJoinWorkerThread) {
+                net.minecraft.server.level.mica.DeferredEffects deferred = net.minecraft.world.level.Level.micaDeferredStatic.get();
+                if (deferred != null) {
+                    deferred.addDeferredEvent(event);
+                }
+                return;
+            }
+            // Mica end
             throw new IllegalStateException(event.getEventName() + " may only be triggered synchronously.");
         }
 

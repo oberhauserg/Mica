@@ -1,0 +1,219 @@
+--- /dev/null
++++ b/net/minecraft/server/level/mica/MicaTickEngine.java
+@@ -1,0 +_,216 @@
++// ============================================================================
++// 6. MicaTickEngine
++// ============================================================================
++//
++// Purpose: The main orchestrator. Replaces the serial tick execution
++// with the SCMC cycle:
++//   1. Snapshot
++//   2. Parallel compute with tracked overlays
++//   3. Merge overlays, detect conflicts
++//   4. Re-run tainted operations serially
++//   5. Apply final state to live world
++//
++// Initially this runs everything serially (Phase 0) to validate
++// the abstraction. Parallelism is enabled in Phase 1+.
++
++package net.minecraft.server.level.mica;
++
++import net.minecraft.core.BlockPos;
++import net.minecraft.server.level.ServerLevel;
++import net.minecraft.world.level.block.state.BlockState;
++import it.unimi.dsi.fastutil.longs.Long2ObjectMap;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++import java.util.*;
++import java.util.concurrent.ForkJoinPool;
++import java.util.concurrent.ForkJoinTask;
++
++public class MicaTickEngine {
++
++    private static final Logger LOGGER = LoggerFactory.getLogger("Mica");
++
++    // Max convergence iterations before we give up and accept the state
++    private static final int MAX_CONVERGENCE_ITERATIONS = 5;
++
++    private final ServerLevel level;
++    private final int threadCount;
++    private final ForkJoinPool workerPool;
++
++    // Reusable overlay pool to avoid allocation each tick
++    private final List<TrackedOverlay> overlayPool;
++
++    // Stats for monitoring
++    private long totalTicks = 0;
++    private long totalConflicts = 0;
++    private long totalTaintedOps = 0;
++    private long totalReRuns = 0;
++
++    public MicaTickEngine(ServerLevel level, int threadCount) {
++        this.level = level;
++        this.threadCount = threadCount;
++        this.workerPool = new ForkJoinPool(threadCount);
++
++        this.overlayPool = new ArrayList<>(threadCount);
++        // Pre-allocate overlays — they'll be populated with the snapshot each tick
++    }
++
++    /**
++     * Execute a set of operations using the SCMC model.
++     *
++     * @param operations The tick operations to execute
++     * @param executor   How to execute a single operation against an overlay
++     */
++    public void executeParallel(
++        List<TickOperation> operations,
++        OperationExecutor executor
++    ) {
++        if (operations.isEmpty()) return;
++
++        this.totalTicks++;
++
++        // --- Phase 1: Snapshot ---
++        WorldSnapshot snapshot = WorldSnapshot.capture(this.level);
++
++        // --- Phase 2: Parallel Compute ---
++        // Prepare overlays (one per thread)
++        while (this.overlayPool.size() < this.threadCount) {
++            this.overlayPool.add(new TrackedOverlay(snapshot));
++        }
++        for (TrackedOverlay overlay : this.overlayPool) {
++            overlay.clear();
++            // Note: overlay still references old snapshot, update it
++            // TODO: add setSnapshot() method to TrackedOverlay
++        }
++
++        // Dispatch operations to worker threads
++        // Each thread picks up operations from a shared queue
++        // and executes them against its thread-local overlay
++        List<ForkJoinTask<?>> tasks = new ArrayList<>();
++        int batchSize = Math.max(1, operations.size() / this.threadCount);
++
++        for (int t = 0; t < this.threadCount; t++) {
++            int start = t * batchSize;
++            int end = (t == this.threadCount - 1)
++                ? operations.size()
++                : Math.min(start + batchSize, operations.size());
++
++            if (start >= operations.size()) break;
++
++            final int threadIndex = t;
++            final TrackedOverlay overlay = this.overlayPool.get(t);
++            final List<TickOperation> batch = operations.subList(start, end);
++
++            tasks.add(this.workerPool.submit(() -> {
++                for (TickOperation op : batch) {
++                    OperationId opId = op.createId(threadIndex);
++                    overlay.setCurrentOperation(opId);
++                    executor.execute(op, overlay);
++                }
++            }));
++        }
++
++        // Wait for all workers to complete
++        for (ForkJoinTask<?> task : tasks) {
++            task.join();
++        }
++
++        // --- Phase 3: Merge ---
++        List<TrackedOverlay> activeOverlays = this.overlayPool.subList(
++            0, Math.min(this.threadCount, tasks.size())
++        );
++        OverlayMerger.MergeResult mergeResult = OverlayMerger.merge(activeOverlays);
++
++        this.totalConflicts += mergeResult.conflictCount();
++        this.totalTaintedOps += mergeResult.taintedOperationCount();
++
++        // --- Phase 4: Re-run tainted operations serially ---
++        if (!mergeResult.taintedOperations().isEmpty()) {
++            this.totalReRuns++;
++
++            LOGGER.debug("Mica: {} tainted operations from {} conflicts, re-running serially",
++                mergeResult.taintedOperationCount(), mergeResult.conflictCount());
++
++            // Create a fresh overlay that includes the clean writes
++            // so the serial re-run sees the non-conflicting results
++            TrackedOverlay rerunOverlay = new TrackedOverlay(snapshot);
++
++            // Apply clean writes to the rerun overlay so serial ops see them
++            for (var entry : mergeResult.cleanWrites().long2ObjectEntrySet()) {
++                rerunOverlay.setBlockState(
++                    BlockPos.of(entry.getLongKey()),
++                    entry.getValue()
++                );
++            }
++
++            // Find and re-run tainted operations in original order
++            for (TickOperation op : operations) {
++                OperationId testId = op.createId(0); // thread index doesn't matter for matching
++                // Check if this operation's type+source matches any tainted op
++                if (isTainted(testId, mergeResult.taintedOperations())) {
++                    rerunOverlay.setCurrentOperation(testId);
++                    executor.execute(op, rerunOverlay);
++                }
++            }
++
++            // Merge rerun overlay writes into clean writes
++            for (var entry : rerunOverlay.getBlockWrites().long2ObjectEntrySet()) {
++                mergeResult.cleanWrites().put(entry.getLongKey(), entry.getValue());
++            }
++        }
++
++        // --- Phase 5: Apply to live world ---
++        applyToWorld(this.level, mergeResult.cleanWrites());
++    }
++
++    /**
++     * Check if an operation matches any tainted operation.
++     * We match on type and source position, ignoring thread index.
++     */
++    private static boolean isTainted(OperationId candidate, Set<OperationId> tainted) {
++        for (OperationId t : tainted) {
++            if (t.type() == candidate.type() && t.sourcePos() == candidate.sourcePos()) {
++                return true;
++            }
++        }
++        return false;
++    }
++
++    /**
++     * Apply merged block state changes to the live world.
++     * This is the single-threaded commit phase.
++     */
++    private static void applyToWorld(ServerLevel level, Long2ObjectMap<BlockState> writes) {
++        for (var entry : writes.long2ObjectEntrySet()) {
++            BlockPos pos = BlockPos.of(entry.getLongKey());
++            BlockState newState = entry.getValue();
++
++            // Use the level's setBlock to trigger all the normal
++            // side effects (lighting updates, chunk dirty marking, etc.)
++            // The flags argument controls which side effects fire.
++            // Block.UPDATE_ALL = notify neighbors + clients
++            level.setBlock(pos, newState, net.minecraft.world.level.block.Block.UPDATE_ALL);
++        }
++    }
++
++    // --- Stats accessors ---
++
++    public long getTotalTicks() { return this.totalTicks; }
++    public long getTotalConflicts() { return this.totalConflicts; }
++    public long getTotalTaintedOps() { return this.totalTaintedOps; }
++    public long getTotalReRuns() { return this.totalReRuns; }
++
++    public double getConflictRate() {
++        return this.totalTicks == 0 ? 0.0 : (double) this.totalConflicts / this.totalTicks;
++    }
++
++    public void logStats() {
++        LOGGER.info("Mica stats: {} ticks, {} total conflicts ({} avg/tick), {} re-run phases",
++            this.totalTicks, this.totalConflicts,
++            String.format("%.2f", this.getConflictRate()),
++            this.totalReRuns);
++    }
++
++    public void shutdown() {
++        this.workerPool.shutdown();
++    }
++}

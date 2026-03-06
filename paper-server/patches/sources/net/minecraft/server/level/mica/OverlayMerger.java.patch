@@ -1,0 +1,163 @@
+--- /dev/null
++++ b/net/minecraft/server/level/mica/OverlayMerger.java
+@@ -1,0 +_,160 @@
++// ============================================================================
++// 5. OverlayMerger
++// ============================================================================
++//
++// Purpose: Takes multiple TrackedOverlays from parallel workers,
++// detects conflicts, identifies tainted operations via provenance
++// graph walking, and produces either a clean merged result or
++// a set of operations that need serial re-execution.
++
++package net.minecraft.server.level.mica;
++
++import net.minecraft.world.level.block.state.BlockState;
++import it.unimi.dsi.fastutil.longs.Long2ObjectMap;
++import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
++import java.util.*;
++
++public class OverlayMerger {
++
++    public record MergeResult(
++        // Clean writes that can be applied directly (no conflicts)
++        Long2ObjectMap<BlockState> cleanWrites,
++
++        // Operations that had conflicts and need serial re-execution
++        Set<OperationId> taintedOperations,
++
++        // Stats
++        int totalWrites,
++        int conflictCount,
++        int taintedOperationCount
++    ) {}
++
++    /**
++     * Merge multiple overlays, detect conflicts, and identify tainted operations.
++     *
++     * @param overlays The overlays from all worker threads
++     * @return MergeResult with clean writes and tainted operations
++     */
++    public static MergeResult merge(List<TrackedOverlay> overlays) {
++
++        // Step 1: Collect all writes, grouped by position
++        // For each position, track which overlays wrote to it
++        Long2ObjectMap<List<WriteEntry>> writesByPosition = new Long2ObjectOpenHashMap<>();
++
++        for (int i = 0; i < overlays.size(); i++) {
++            TrackedOverlay overlay = overlays.get(i);
++            for (var entry : overlay.getBlockWrites().long2ObjectEntrySet()) {
++                long pos = entry.getLongKey();
++                BlockState state = entry.getValue();
++                OperationId source = overlay.getWriteProvenance().get(pos);
++
++                writesByPosition
++                    .computeIfAbsent(pos, k -> new ArrayList<>())
++                    .add(new WriteEntry(i, state, source));
++            }
++        }
++
++        // Step 2: Identify conflict positions (written by multiple overlays)
++        Set<OperationId> taintedOps = new HashSet<>();
++        Long2ObjectMap<BlockState> cleanWrites = new Long2ObjectOpenHashMap<>();
++        int conflictCount = 0;
++
++        for (var entry : writesByPosition.long2ObjectEntrySet()) {
++            long pos = entry.getLongKey();
++            List<WriteEntry> writes = entry.getValue();
++
++            if (writes.size() == 1) {
++                // No conflict — single writer
++                cleanWrites.put(pos, writes.get(0).state());
++            } else {
++                // Conflict! Multiple overlays wrote to same position
++                conflictCount++;
++
++                // Taint all operations that wrote here
++                for (WriteEntry write : writes) {
++                    if (write.source() != null) {
++                        taintedOps.add(write.source());
++                    }
++                }
++            }
++        }
++
++        // Step 3: Check for read-write conflicts
++        // An operation is also tainted if it READ from a position
++        // that was WRITTEN by a different overlay
++        for (int i = 0; i < overlays.size(); i++) {
++            TrackedOverlay overlay = overlays.get(i);
++            for (var readEntry : overlay.getReadProvenance().long2ObjectEntrySet()) {
++                long pos = readEntry.getLongKey();
++                Set<OperationId> readers = readEntry.getValue();
++
++                // Check if any OTHER overlay wrote to this position
++                List<WriteEntry> writes = writesByPosition.get(pos);
++                if (writes == null) continue;
++
++                for (WriteEntry write : writes) {
++                    if (write.overlayIndex() != i) {
++                        // Different overlay wrote to a position this overlay read
++                        // Taint all operations that read this position on this overlay
++                        taintedOps.addAll(readers);
++                        // Also taint the writer
++                        if (write.source() != null) {
++                            taintedOps.add(write.source());
++                        }
++                    }
++                }
++            }
++        }
++
++        // Step 4: Transitive closure — walk the provenance graph
++        // If operation A is tainted and wrote to position P,
++        // and operation B read from position P, then B is also tainted
++        boolean changed = true;
++        while (changed) {
++            changed = false;
++            for (TrackedOverlay overlay : overlays) {
++                for (var readEntry : overlay.getReadProvenance().long2ObjectEntrySet()) {
++                    long pos = readEntry.getLongKey();
++                    Set<OperationId> readers = readEntry.getValue();
++
++                    // Check if any tainted operation wrote to this position
++                    for (TrackedOverlay writerOverlay : overlays) {
++                        OperationId writer = writerOverlay.getWriteProvenance().get(pos);
++                        if (writer != null && taintedOps.contains(writer)) {
++                            // Taint all readers of this position
++                            for (OperationId reader : readers) {
++                                if (!taintedOps.contains(reader)) {
++                                    taintedOps.add(reader);
++                                    changed = true;
++                                }
++                            }
++                        }
++                    }
++                }
++            }
++        }
++
++        // Step 5: Remove tainted operations' writes from cleanWrites
++        for (TrackedOverlay overlay : overlays) {
++            for (var writeEntry : overlay.getWriteProvenance().long2ObjectEntrySet()) {
++                if (taintedOps.contains(writeEntry.getValue())) {
++                    cleanWrites.remove(writeEntry.getLongKey());
++                }
++            }
++        }
++
++        return new MergeResult(
++            cleanWrites,
++            taintedOps,
++            writesByPosition.size(),
++            conflictCount,
++            taintedOps.size()
++        );
++    }
++
++    private record WriteEntry(
++        int overlayIndex,
++        BlockState state,
++        OperationId source
++    ) {}
++}

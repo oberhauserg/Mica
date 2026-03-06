@@ -1,0 +1,103 @@
+--- /dev/null
++++ b/net/minecraft/server/level/mica/DeferredEffects.java
+@@ -1,0 +_,100 @@
++package net.minecraft.server.level.mica;
++
++import net.minecraft.core.BlockPos;
++import net.minecraft.server.level.ServerLevel;
++import net.minecraft.world.entity.Entity;
++import net.minecraft.world.level.block.state.BlockState;
++import org.bukkit.event.Event;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++import java.util.ArrayList;
++import java.util.List;
++
++/**
++ * Buffers all side effects that occur during parallel tick processing
++ * and need to be applied on the main thread.
++ *
++ * Each worker thread gets one of these. After parallel execution completes,
++ * the main thread drains all buffers in order.
++ */
++public class DeferredEffects {
++
++    private static final Logger LOGGER = LoggerFactory.getLogger("Mica");
++
++    // Entity spawns (item drops from leaf decay, lightning bolts, etc.)
++    private final List<EntitySpawn> entitySpawns = new ArrayList<>();
++
++    // Bukkit events that were skipped during parallel execution
++    private final List<DeferredEvent> deferredEvents = new ArrayList<>();
++
++    // Sound/particle effects
++    private final List<Runnable> effects = new ArrayList<>();
++
++    // Generic deferred tasks (anything else we discover)
++    private final List<Runnable> deferredTasks = new ArrayList<>();
++
++    // Stats
++    private int skippedEventCount = 0;
++    private int skippedEntitySpawnCount = 0;
++    private int skippedOtherCount = 0;
++
++    public void addEntitySpawn(Entity entity, org.bukkit.event.entity.CreatureSpawnEvent.SpawnReason reason) {
++        this.entitySpawns.add(new EntitySpawn(entity, reason));
++        this.skippedEntitySpawnCount++;
++    }
++
++    public void addDeferredEvent(Event event) {
++        this.deferredEvents.add(new DeferredEvent(event));
++        this.skippedEventCount++;
++    }
++
++    public void addDeferredTask(Runnable task) {
++        this.deferredTasks.add(task);
++        this.skippedOtherCount++;
++    }
++
++    /**
++     * Apply all buffered effects to the world on the main thread.
++     */
++    public void apply(ServerLevel level) {
++        // Spawn deferred entities
++        for (EntitySpawn spawn : this.entitySpawns) {
++            level.addFreshEntity(spawn.entity(), spawn.reason());
++        }
++
++        // Fire deferred events
++        for (DeferredEvent event : this.deferredEvents) {
++            event.event().callEvent();
++        }
++
++        // Run deferred tasks
++        for (Runnable task : this.deferredTasks) {
++            task.run();
++        }
++    }
++
++    public void clear() {
++        this.entitySpawns.clear();
++        this.deferredEvents.clear();
++        this.effects.clear();
++        this.deferredTasks.clear();
++        this.skippedEventCount = 0;
++        this.skippedEntitySpawnCount = 0;
++        this.skippedOtherCount = 0;
++    }
++
++    public boolean isEmpty() {
++        return this.entitySpawns.isEmpty()
++            && this.deferredEvents.isEmpty()
++            && this.effects.isEmpty()
++            && this.deferredTasks.isEmpty();
++    }
++
++    public int getSkippedEventCount() { return this.skippedEventCount; }
++    public int getSkippedEntitySpawnCount() { return this.skippedEntitySpawnCount; }
++    public int getSkippedOtherCount() { return this.skippedOtherCount; }
++
++    public record EntitySpawn(Entity entity, org.bukkit.event.entity.CreatureSpawnEvent.SpawnReason reason) {}
++    public record DeferredEvent(Event event) {}
++}

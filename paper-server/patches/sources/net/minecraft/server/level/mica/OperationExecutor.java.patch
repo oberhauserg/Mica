@@ -1,0 +1,25 @@
+--- /dev/null
++++ b/net/minecraft/server/level/mica/OperationExecutor.java
+@@ -1,0 +_,22 @@
++// ============================================================================
++// 8. OperationExecutor
++// ============================================================================
++//
++// Purpose: Functional interface for executing an operation against an overlay.
++// The implementation contains the actual game logic — calling
++// blockState.tick(), entity.tick(), etc. against the overlay
++// instead of the live world.
++
++package net.minecraft.server.level.mica;
++
++@FunctionalInterface
++public interface OperationExecutor {
++    /**
++     * Execute a single tick operation using the given overlay for
++     * world reads and writes.
++     *
++     * @param operation The operation to execute
++     * @param overlay   The tracked overlay to read from / write to
++     */
++    void execute(TickOperation operation, TrackedOverlay overlay);
++}

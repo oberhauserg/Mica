@@ -1,0 +1,96 @@
+--- /dev/null
++++ b/net/minecraft/server/level/mica/TickOperation.java
+@@ -1,0 +_,93 @@
++
++// ============================================================================
++// 7. TickOperation
++// ============================================================================
++//
++// Purpose: Represents a single unit of work that can be dispatched
++// to a worker thread. Wraps a scheduled tick, entity tick, etc.
++
++package net.minecraft.server.level.mica;
++
++import net.minecraft.core.BlockPos;
++
++public abstract class TickOperation {
++
++    /**
++     * Create an OperationId for this operation.
++     */
++    public abstract OperationId createId(int threadIndex);
++
++    // --- Concrete subtypes ---
++
++    public static class BlockTickOp extends TickOperation {
++        private final BlockPos pos;
++        private final net.minecraft.world.level.block.Block block;
++
++        public BlockTickOp(BlockPos pos, net.minecraft.world.level.block.Block block) {
++            this.pos = pos;
++            this.block = block;
++        }
++
++        @Override
++        public OperationId createId(int threadIndex) {
++            return OperationId.blockTick(this.pos, threadIndex);
++        }
++
++        public BlockPos getPos() { return this.pos; }
++        public net.minecraft.world.level.block.Block getBlock() { return this.block; }
++    }
++
++    public static class FluidTickOp extends TickOperation {
++        private final BlockPos pos;
++        private final net.minecraft.world.level.material.Fluid fluid;
++
++        public FluidTickOp(BlockPos pos, net.minecraft.world.level.material.Fluid fluid) {
++            this.pos = pos;
++            this.fluid = fluid;
++        }
++
++        @Override
++        public OperationId createId(int threadIndex) {
++            return OperationId.fluidTick(this.pos, threadIndex);
++        }
++
++        public BlockPos getPos() { return this.pos; }
++        public net.minecraft.world.level.material.Fluid getFluid() { return this.fluid; }
++    }
++
++    public static class EntityTickOp extends TickOperation {
++        private final net.minecraft.world.entity.Entity entity;
++
++        public EntityTickOp(net.minecraft.world.entity.Entity entity) {
++            this.entity = entity;
++        }
++
++        @Override
++        public OperationId createId(int threadIndex) {
++            return OperationId.entityTick(this.entity.getId(), threadIndex);
++        }
++
++        public net.minecraft.world.entity.Entity getEntity() { return this.entity; }
++    }
++
++    public static class BlockEntityTickOp extends TickOperation {
++        private final BlockPos pos;
++        private final net.minecraft.world.level.block.entity.TickingBlockEntity ticker;
++
++        public BlockEntityTickOp(BlockPos pos,
++                                 net.minecraft.world.level.block.entity.TickingBlockEntity ticker) {
++            this.pos = pos;
++            this.ticker = ticker;
++        }
++
++        @Override
++        public OperationId createId(int threadIndex) {
++            return OperationId.blockEntityTick(this.pos, threadIndex);
++        }
++
++        public BlockPos getPos() { return this.pos; }
++        public net.minecraft.world.level.block.entity.TickingBlockEntity getTicker() {
++            return this.ticker;
++        }
++    }
++}
