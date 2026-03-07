@@ -118,9 +118,12 @@ public class TickThread extends Thread {
         return (TickThread)Thread.currentThread();
     }
 
+    // mica start - tick threads in mica are marked appropriately.
+    public static final ThreadLocal<Boolean> micaParallelPhase = ThreadLocal.withInitial(() -> Boolean.FALSE);
     public static boolean isTickThread() {
-        return Thread.currentThread() instanceof TickThread;
+        return Thread.currentThread() instanceof TickThread || micaParallelPhase.get();
     }
+    // mica end
 
     public static boolean isShutdownThread() {
         return false;
