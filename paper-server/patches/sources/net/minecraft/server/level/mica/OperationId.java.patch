@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/net/minecraft/server/level/mica/OperationId.java
-@@ -1,0 +_,52 @@
+@@ -1,0 +_,59 @@
 +// ============================================================================
 +// 3. OperationId
 +// ============================================================================
@@ -23,6 +23,13 @@
 +     */
 +    public static OperationId blockTick(BlockPos pos, int threadIndex) {
 +        return new OperationId(OperationType.BLOCK_TICK, pos.asLong(), threadIndex);
++    }
++
++    /**
++     * Create an ID for a chunk tick operation (random ticks, ice/snow).
++     */
++    public static OperationId chunkTick(long chunkPos, int threadIndex) {
++        return new OperationId(OperationType.CHUNK_TICK, chunkPos, threadIndex);
 +    }
 +
 +    /**

@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/net/minecraft/server/level/mica/TrackedOverlay.java
-@@ -1,0 +_,178 @@
+@@ -1,0 +_,216 @@
 +
 +
 +// ============================================================================
@@ -55,9 +55,39 @@
 +    private int writeCount = 0;
 +    private int overlayHitCount = 0;
 +
++    // Thread index for this overlay
++    private int threadIndex;
++
++    // Record of every block that was random-ticked, so we can re-run specific ones
++    private final java.util.List<TickRecord> tickRecords = new java.util.ArrayList<>();
++
++    public record ReadRecord(OperationId opId, long pos) {}
++
++    private final java.util.List<ReadRecord> operationReads = new java.util.ArrayList<>();
++    private final it.unimi.dsi.fastutil.longs.LongOpenHashSet readPositions = new it.unimi.dsi.fastutil.longs.LongOpenHashSet();
++
 +    public TrackedOverlay(WorldSnapshot snapshot) {
 +        this.snapshot = snapshot;
 +    }
++
++
++    public void setThreadIndex(int threadIndex) {
++        this.threadIndex = threadIndex;
++    }
++
++    public int getThreadIndex() {
++        return this.threadIndex;
++    }
++
++    public void recordTick(OperationId opId, BlockPos pos) {
++        this.tickRecords.add(new TickRecord(opId, pos.immutable()));
++    }
++
++    public java.util.List<TickRecord> getTickRecords() {
++        return this.tickRecords;
++    }
++
++    public record TickRecord(OperationId opId, BlockPos pos) {}
 +
 +    /**
 +     * Set the current operation context.
@@ -75,23 +105,19 @@
 +    @Override
 +    public BlockState getBlockState(BlockPos pos) {
 +        long packed = pos.asLong();
-+
-+        // Track the read
 +        this.readCount++;
++        this.readPositions.add(packed);
++
 +        if (this.currentOperation != null) {
-+            this.readProvenance
-+                .computeIfAbsent(packed, k -> new HashSet<>())
-+                .add(this.currentOperation);
++            this.operationReads.add(new ReadRecord(this.currentOperation, packed));
 +        }
 +
-+        // Check overlay first
 +        BlockState overlayState = this.blockWrites.get(packed);
 +        if (overlayState != null) {
 +            this.overlayHitCount++;
 +            return overlayState;
 +        }
 +
-+        // Fall through to snapshot
 +        return this.snapshot.getBlockState(pos);
 +    }
 +
@@ -166,6 +192,14 @@
 +    public int getWriteCount() { return this.writeCount; }
 +    public int getOverlayHitCount() { return this.overlayHitCount; }
 +
++    public it.unimi.dsi.fastutil.longs.LongOpenHashSet getReadPositions() {
++        return this.readPositions;
++    }
++
++    public java.util.List<ReadRecord> getOperationReads() {
++        return this.operationReads;
++    }
++
 +    /**
 +     * Clear the overlay for reuse.
 +     */
@@ -173,7 +207,11 @@
 +        this.blockWrites.clear();
 +        this.writeProvenance.clear();
 +        this.readProvenance.clear();
++        this.readPositions.clear();
++        this.operationReads.clear();
 +        this.currentOperation = null;
++        this.threadIndex = 0;
++        this.tickRecords.clear();
 +        this.readCount = 0;
 +        this.writeCount = 0;
 +        this.overlayHitCount = 0;
