@@ -1,0 +1,2173 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grant Oberhauser <oberhausergrant@gmail.com>
+Date: Sat, 7 Mar 2026 18:33:16 -0800
+Subject: [PATCH] Mica: Parallel tick processing with SCMC architecture
+
+
+diff --git a/ca/spottedleaf/moonrise/patches/chunk_system/level/entity/EntityLookup.java b/ca/spottedleaf/moonrise/patches/chunk_system/level/entity/EntityLookup.java
+index 2d24d03bbdb5ee0d862cbfff2219f58afffafe12..38692a70bb6478fcecdaa7312da42f474dfe0f42 100644
+--- a/ca/spottedleaf/moonrise/patches/chunk_system/level/entity/EntityLookup.java
++++ b/ca/spottedleaf/moonrise/patches/chunk_system/level/entity/EntityLookup.java
+@@ -8,6 +8,7 @@ import ca.spottedleaf.moonrise.common.util.WorldUtil;
+ import ca.spottedleaf.moonrise.patches.chunk_system.entity.ChunkSystemEntity;
+ import net.minecraft.core.BlockPos;
+ import net.minecraft.server.level.FullChunkStatus;
++import net.minecraft.server.level.mica.DeferredEffects;
+ import net.minecraft.util.AbortableIterationConsumer;
+ import net.minecraft.util.Mth;
+ import net.minecraft.world.entity.Entity;
+@@ -964,11 +965,34 @@ public abstract class EntityLookup implements LevelEntityGetter<Entity> {
+ 
+         @Override
+         public void onMove() {
++            // Mica start - defer chunk moves during parallel execution
++            if (ca.spottedleaf.moonrise.common.util.TickThread.micaParallelPhase.get()) {
++                net.minecraft.server.level.mica.DeferredEffects deferred =
++                    net.minecraft.world.level.Level.micaDeferredStatic.get();
++                if (deferred != null) {
++                    final Entity movingEntity = this.entity;
++                    deferred.addDeferredTask(() -> {
++                        try {
++                            final Visibility oldVisibility = getEntityStatus(movingEntity);
++                            final ChunkEntitySlices newSlices = EntityLookup.this.moveEntity(movingEntity);
++                            if (newSlices == null) {
++                                return;
++                            }
++                            final Visibility newVisibility = getEntityStatus(movingEntity);
++                            EntityLookup.this.entityStatusChange(movingEntity, newSlices, oldVisibility, newVisibility, true, false, false);
++                        } catch (Throwable t) {
++                            // Entity chunk data is stale — will self-correct next tick
++                        }
++                    });
++                    return;
++                }
++            }
++            // Mica end
++
+             final Entity entity = this.entity;
+             final Visibility oldVisibility = getEntityStatus(entity);
+             final ChunkEntitySlices newSlices = EntityLookup.this.moveEntity(this.entity);
+             if (newSlices == null) {
+-                // no new section, so didn't change sections
+                 return;
+             }
+ 
+diff --git a/net/minecraft/server/level/ServerChunkCache.java b/net/minecraft/server/level/ServerChunkCache.java
+index af67b07722bb0125acd081dab767d7e7b360623b..a565abc66c1f7df61f6d55a95284fa42deeee950 100644
+--- a/net/minecraft/server/level/ServerChunkCache.java
++++ b/net/minecraft/server/level/ServerChunkCache.java
+@@ -50,6 +50,7 @@ import net.minecraft.world.level.entity.ChunkStatusUpdateListener;
+ import net.minecraft.world.level.gamerules.GameRules;
+ import net.minecraft.world.level.levelgen.RandomState;
+ import net.minecraft.world.level.levelgen.structure.templatesystem.StructureTemplateManager;
++import net.minecraft.world.level.redstone.CollectingNeighborUpdater;
+ import net.minecraft.world.level.storage.DimensionDataStorage;
+ import net.minecraft.world.level.storage.LevelStorageSource;
+ import org.jspecify.annotations.Nullable;
+@@ -153,34 +154,273 @@ public class ServerChunkCache extends ChunkSource implements ca.spottedleaf.moon
+ 
+         return load ? this.syncLoad(chunkX, chunkZ, toStatus) : null;
+     }
+-    // Paper end - rewrite chunk system
++    // Mica start - parallel random tick infrastructure
++    public static final int MICA_THREAD_COUNT = Math.max(2, Runtime.getRuntime().availableProcessors());
++    public static final java.util.concurrent.ForkJoinPool MICA_POOL = new java.util.concurrent.ForkJoinPool(MICA_THREAD_COUNT);
++    public static final org.slf4j.Logger MICA_LOGGER = org.slf4j.LoggerFactory.getLogger("Mica");
++
++    // Reusable overlay array to reduce allocation
++    private net.minecraft.server.level.mica.TrackedOverlay[] micaOverlays;
++
++    private long micaCumulativeReads = 0;
++    private long micaCumulativeWrites = 0;
++    private long micaCumulativeConflicts = 0;
++    private long micaCumulativeTainted = 0;
++    private long micaCumulativeReruns = 0;
++
+     // Paper start - chunk tick iteration optimisations
+     private final ca.spottedleaf.moonrise.common.util.SimpleThreadUnsafeRandom shuffleRandom = new ca.spottedleaf.moonrise.common.util.SimpleThreadUnsafeRandom(0L);
+     private void iterateTickingChunksFaster() {
+         final ServerLevel world = this.level;
+         final int randomTickSpeed = world.getGameRules().get(GameRules.RANDOM_TICK_SPEED);
+ 
+-        // TODO check on update: impl of forEachBlockTickingChunk will only iterate ENTITY ticking chunks!
+-        // TODO check on update: consumer just runs tickChunk
+-        final ca.spottedleaf.moonrise.common.list.ReferenceList<net.minecraft.world.level.chunk.LevelChunk> entityTickingChunks = ((ca.spottedleaf.moonrise.patches.chunk_system.level.ChunkSystemServerLevel)world).moonrise$getEntityTickingChunks();
++        final ca.spottedleaf.moonrise.common.list.ReferenceList<net.minecraft.world.level.chunk.LevelChunk> entityTickingChunks =
++            ((ca.spottedleaf.moonrise.patches.chunk_system.level.ChunkSystemServerLevel) world).moonrise$getEntityTickingChunks();
+ 
+-        // note: we can use the backing array here because:
+-        // 1. we do not care about new additions
+-        // 2. _removes_ are impossible at this stage in the tick
+         final LevelChunk[] raw = entityTickingChunks.getRawDataUnchecked();
+         final int size = entityTickingChunks.size();
+ 
++        if (size == 0) return;
++
++        // --- Phase 1: Snapshot ---
++        long timeStart = System.nanoTime();
++
++        final net.minecraft.server.level.mica.WorldSnapshot snapshot =
++            net.minecraft.server.level.mica.WorldSnapshot.capture(world);
++
++        long timeSnapshot = System.nanoTime();
++
++        // --- Phase 2: Parallel Compute ---
++        // Initialize or reuse overlays
++        if (this.micaOverlays == null || this.micaOverlays.length < MICA_THREAD_COUNT) {
++            this.micaOverlays = new net.minecraft.server.level.mica.TrackedOverlay[MICA_THREAD_COUNT];
++        }
++        for (int t = 0; t < MICA_THREAD_COUNT; t++) {
++            if (this.micaOverlays[t] == null) {
++                this.micaOverlays[t] = new net.minecraft.server.level.mica.TrackedOverlay(snapshot);
++            } else {
++                this.micaOverlays[t].clear();
++                this.micaOverlays[t].setSnapshot(snapshot);
++            }
++            this.micaOverlays[t].deferredEffects = new net.minecraft.server.level.mica.DeferredEffects();
++        }
++
++        // Build a mapping from OperationId source position to chunk index
++        // so we can re-run tainted chunks in the converge phase
++        final it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap chunkPosToIndex =
++            new it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap(size);
++        chunkPosToIndex.defaultReturnValue(-1);
++
+         java.util.Objects.checkFromToIndex(0, size, raw.length);
+-        for (int i = 0; i < size; ++i) {
+-            world.tickChunk(raw[i], randomTickSpeed);
++        for (int i = 0; i < size; i++) {
++            chunkPosToIndex.put(raw[i].getPos().toLong(), i);
++        }
++
++        // Dispatch to thread pool
++        final int batchSize = Math.max(1, (size + MICA_THREAD_COUNT - 1) / MICA_THREAD_COUNT);
++        final java.util.concurrent.CountDownLatch latch = new java.util.concurrent.CountDownLatch(MICA_THREAD_COUNT);
++        final java.util.concurrent.atomic.AtomicReference<Throwable> error = new java.util.concurrent.atomic.AtomicReference<>();
+ 
+-            // call mid-tick tasks for chunk system
+-            if ((i & 7) == 0) {
+-                ((ca.spottedleaf.moonrise.patches.chunk_system.server.ChunkSystemMinecraftServer)this.level.getServer()).moonrise$executeMidTickTasks();
++        for (int t = 0; t < MICA_THREAD_COUNT; t++) {
++            final int threadIndex = t;
++            final int start = t * batchSize;
++            final int end = Math.min(start + batchSize, size);
++
++            if (start >= size) {
++                latch.countDown();
+                 continue;
+             }
++
++            final net.minecraft.server.level.mica.TrackedOverlay overlay = this.micaOverlays[t];
++
++            MICA_POOL.execute(() -> {
++                try {
++                    ca.spottedleaf.moonrise.common.util.TickThread.micaParallelPhase.set(Boolean.TRUE);
++                    world.micaOverlay.set(overlay);
++                    CollectingNeighborUpdater threadUpdater = new CollectingNeighborUpdater(
++                        world,
++                        world.getServer().getMaxChainedNeighborUpdates());
++                    Level.micaNeighborUpdater.set(threadUpdater);
++
++                    net.minecraft.world.level.Level.micaDeferredStatic.set(overlay.deferredEffects);
++                    try {
++                        overlay.setThreadIndex(threadIndex);
++                        for (int i = start; i < end; i++) {
++                            world.tickChunk(raw[i], randomTickSpeed);
++                        }
++                    } finally {
++                        world.micaOverlay.remove();
++                        net.minecraft.world.level.Level.micaDeferredStatic.remove();
++                    }
++                } catch (Throwable t1) {
++                    error.compareAndSet(null, t1);
++                    MICA_LOGGER.error("[Mica] Error in parallel chunk tick on thread {}", threadIndex, t1);
++                } finally {
++                    ca.spottedleaf.moonrise.common.util.TickThread.micaParallelPhase.set(Boolean.FALSE);
++                    world.micaOverlay.remove();
++                    Level.micaNeighborUpdater.remove();
++                    net.minecraft.world.level.Level.micaDeferredStatic.remove();
++                    latch.countDown();
++                }
++            });
++        }
++
++        try {
++            latch.await();
++        } catch (InterruptedException e) {
++            Thread.currentThread().interrupt();
++        }
++
++        long timeCompute = System.nanoTime();
++
++        // Check for errors
++        if (error.get() != null) {
++            MICA_LOGGER.error("[Mica] Parallel tick failed, skipping merge/apply");
++            return;
++        }
++
++        // --- Phase 3: Merge ---
++        java.util.List<net.minecraft.server.level.mica.TrackedOverlay> activeOverlays =
++            java.util.Arrays.asList(this.micaOverlays).subList(0, MICA_THREAD_COUNT);
++
++        net.minecraft.server.level.mica.OverlayMerger.MergeResult mergeResult =
++            net.minecraft.server.level.mica.OverlayMerger.merge(activeOverlays);
++
++        long timeMerge = System.nanoTime();
++
++        // --- Phase 4: Converge (re-run tainted operations) ---
++        int rerunCount = 0;
++
++        if (!mergeResult.taintedOperations().isEmpty()) {
++            net.minecraft.server.level.mica.TrackedOverlay rerunOverlay =
++                new net.minecraft.server.level.mica.TrackedOverlay(snapshot);
++            rerunOverlay.deferredEffects = new net.minecraft.server.level.mica.DeferredEffects();
++
++            // Apply clean writes so re-runs see non-conflicting results
++            for (var entry : mergeResult.cleanWrites().long2ObjectEntrySet()) {
++                rerunOverlay.setBlockState(
++                    net.minecraft.core.BlockPos.of(entry.getLongKey()),
++                    entry.getValue());
++            }
++
++            // Collect tainted block positions from all overlays' tick records
++            java.util.List<net.minecraft.server.level.mica.TrackedOverlay.TickRecord> toRerun =
++                new java.util.ArrayList<>();
++
++            for (int t = 0; t < MICA_THREAD_COUNT; t++) {
++                for (net.minecraft.server.level.mica.TrackedOverlay.TickRecord record :
++                    this.micaOverlays[t].getTickRecords()) {
++                    if (mergeResult.taintedOperations().contains(record.opId())) {
++                        toRerun.add(record);
++                    }
++                }
++            }
++
++            // Re-run individual tainted block ticks serially
++            world.micaOverlay.set(rerunOverlay);
++            net.minecraft.world.level.Level.micaDeferredStatic.set(rerunOverlay.deferredEffects);
++            try {
++                for (net.minecraft.server.level.mica.TrackedOverlay.TickRecord record : toRerun) {
++                    rerunOverlay.setCurrentOperation(record.opId());
++                    net.minecraft.core.BlockPos pos = record.pos();
++                    net.minecraft.world.level.block.state.BlockState state = rerunOverlay.getBlockState(pos);
++
++                    if (record.opId().type() == net.minecraft.server.level.mica.OperationType.RANDOM_TICK) {
++                        state.randomTick(world, pos, world.random);
++                    } else if (record.opId().type() == net.minecraft.server.level.mica.OperationType.FLUID_TICK) {
++                        net.minecraft.world.level.material.FluidState fluidState = state.getFluidState();
++                        if (fluidState.isRandomlyTicking()) {
++                            fluidState.randomTick(world, pos, world.random);
++                        }
++                    }
++                    rerunCount++;
++                }
++            } finally {
++                world.micaOverlay.remove();
++                net.minecraft.world.level.Level.micaDeferredStatic.remove();
++            }
++
++            // Merge rerun writes into final result
++            for (var entry : rerunOverlay.getBlockWrites().long2ObjectEntrySet()) {
++                mergeResult.cleanWrites().put(entry.getLongKey(), entry.getValue());
++            }
++
++            if (!rerunOverlay.deferredEffects.isEmpty()) {
++                rerunOverlay.deferredEffects.apply(world);
++            }
+         }
++
++        long timeConverge = System.nanoTime();
++
++        // --- Apply clean writes to live world ---
++        for (var entry : mergeResult.cleanWrites().long2ObjectEntrySet()) {
++            net.minecraft.core.BlockPos pos = net.minecraft.core.BlockPos.of(entry.getLongKey());
++            net.minecraft.world.level.block.state.BlockState state = entry.getValue();
++            world.setBlock(pos, state, net.minecraft.world.level.block.Block.UPDATE_ALL);
++        }
++
++        // Apply deferred effects from parallel phase on main thread
++        for (int t = 0; t < MICA_THREAD_COUNT; t++) {
++            net.minecraft.server.level.mica.DeferredEffects deferred = this.micaOverlays[t].deferredEffects;
++            if (deferred != null && !deferred.isEmpty()) {
++                deferred.apply(world);
++            }
++        }
++
++        long timeApply = System.nanoTime();
++
++        // --- Stats ---
++        for (int t = 0; t < MICA_THREAD_COUNT; t++) {
++            micaCumulativeReads += this.micaOverlays[t].getReadCount();
++            micaCumulativeWrites += this.micaOverlays[t].getWriteCount();
++        }
++        micaCumulativeConflicts += mergeResult.conflictCount();
++        micaCumulativeTainted += mergeResult.taintedOperationCount();
++        micaCumulativeReruns += rerunCount;
++
++        world.micaTickCount++;
++        if (world.micaTickCount % 200 == 0) {
++            int totalReads = 0, totalWrites = 0, totalDeferred = 0;
++            for (int t = 0; t < MICA_THREAD_COUNT; t++) {
++                totalReads += this.micaOverlays[t].getReadCount();
++                totalWrites += this.micaOverlays[t].getWriteCount();
++                if (this.micaOverlays[t].deferredEffects != null) {
++                    totalDeferred += this.micaOverlays[t].deferredEffects.getSkippedEntitySpawnCount()
++                        + this.micaOverlays[t].deferredEffects.getSkippedEventCount();
++                }
++            }
++
++            double msSnapshot = (timeSnapshot - timeStart) / 1_000_000.0;
++            double msCompute = (timeCompute - timeSnapshot) / 1_000_000.0;
++            double msMerge = (timeMerge - timeCompute) / 1_000_000.0;
++            double msConverge = (timeConverge - timeMerge) / 1_000_000.0;
++            double msApply = (timeApply - timeConverge) / 1_000_000.0;
++            double msTotal = (timeApply - timeStart) / 1_000_000.0;
++
++            MICA_LOGGER.info("{} threads | {} chunks | {} reads, {} writes | {} conflicts, {} tainted, {} re-runs",
++                MICA_THREAD_COUNT, size, micaCumulativeReads, micaCumulativeWrites,
++                micaCumulativeConflicts, micaCumulativeTainted, micaCumulativeReruns);
++            MICA_LOGGER.info("Timing: {}ms total | snapshot {}ms | compute {}ms | merge {}ms | converge {}ms | apply {}ms",
++                String.format("%.2f", msTotal),
++                String.format("%.2f", msSnapshot),
++                String.format("%.2f", msCompute),
++                String.format("%.2f", msMerge),
++                String.format("%.2f", msConverge),
++                String.format("%.2f", msApply));
++
++            micaCumulativeReads = 0;
++            micaCumulativeWrites = 0;
++            micaCumulativeConflicts = 0;
++            micaCumulativeTainted = 0;
++            micaCumulativeReruns = 0;
++
++        }
++        // Mica end
++
++        // Run mid-tick tasks on the main thread
++        ((ca.spottedleaf.moonrise.patches.chunk_system.server.ChunkSystemMinecraftServer) this.level.getServer()).moonrise$executeMidTickTasks();
+     }
++    // Mica end
+     // Paper end - chunk tick iteration optimisations
+ 
+ 
+diff --git a/net/minecraft/server/level/ServerLevel.java b/net/minecraft/server/level/ServerLevel.java
+index dc65503a2d785d64d37b76b0303f51cf66d9769a..f1ae45545e87e396089ab4820ee03f41b0edca26 100644
+--- a/net/minecraft/server/level/ServerLevel.java
++++ b/net/minecraft/server/level/ServerLevel.java
+@@ -162,6 +162,7 @@ import net.minecraft.world.level.material.Fluid;
+ import net.minecraft.world.level.material.FluidState;
+ import net.minecraft.world.level.pathfinder.PathTypeCache;
+ import net.minecraft.world.level.portal.PortalForcer;
++import net.minecraft.world.level.redstone.CollectingNeighborUpdater;
+ import net.minecraft.world.level.redstone.ExperimentalRedstoneUtils;
+ import net.minecraft.world.level.redstone.Orientation;
+ import net.minecraft.world.level.saveddata.maps.MapId;
+@@ -221,6 +222,10 @@ public class ServerLevel extends Level implements ServerEntityGetter, WorldGenLe
+     private final RandomSequences randomSequences;
+     final LevelDebugSynchronizers debugSynchronizers = new LevelDebugSynchronizers(this);
+ 
++    // Mica start - overlay-wrapped random tick execution
++    long micaTickCount = 0;
++    // Mica end
++
+     // CraftBukkit start
+     public final LevelStorageSource.LevelStorageAccess levelStorageAccess;
+     public final UUID uuid;
+@@ -746,6 +751,8 @@ public class ServerLevel extends Level implements ServerEntityGetter, WorldGenLe
+         return this.environmentAttributes;
+     }
+ 
++    public long micaEntityTickCount = 0;
++
+     public void tick(BooleanSupplier hasTimeLeft) {
+         ProfilerFiller profilerFiller = Profiler.get();
+         this.handlingTick = true;
+@@ -832,32 +839,161 @@ public class ServerLevel extends Level implements ServerEntityGetter, WorldGenLe
+             }
+ 
+             io.papermc.paper.entity.activation.ActivationRange.activateEntities(this); // Paper - EAR
+-            this.entityTickList
+-                .forEach(
+-                    entity -> {
+-                        if (!entity.isRemoved()) {
+-                            if (!tickRateManager.isEntityFrozen(entity)) {
+-                                profilerFiller.push("checkDespawn");
+-                                entity.checkDespawn();
+-                                profilerFiller.pop();
+-                                if (true) { // Paper - rewrite chunk system
++
++            // Mica start - parallel entity ticking
++            final TickRateManager micaTickRateManager = tickRateManager;
++
++            // Collect entities to tick into a list for partitioning
++            final java.util.List<Entity> entitiesToTick = new java.util.ArrayList<>();
++            this.entityTickList.forEach(entity -> {
++                if (!entity.isRemoved() && !micaTickRateManager.isEntityFrozen(entity)) {
++                    entitiesToTick.add(entity);
++                }
++            });
++
++            if (!entitiesToTick.isEmpty()) {
++
++                long entityTimeStart = System.nanoTime();
++                final net.minecraft.server.level.mica.WorldSnapshot entitySnapshot =
++                    net.minecraft.server.level.mica.WorldSnapshot.capture(this);
++
++                final int threadCount = net.minecraft.server.level.ServerChunkCache.MICA_THREAD_COUNT;
++                final net.minecraft.server.level.mica.TrackedOverlay[] entityOverlays =
++                    new net.minecraft.server.level.mica.TrackedOverlay[threadCount];
++
++                for (int t = 0; t < threadCount; t++) {
++                    entityOverlays[t] = new net.minecraft.server.level.mica.TrackedOverlay(entitySnapshot);
++                    entityOverlays[t].deferredEffects = new net.minecraft.server.level.mica.DeferredEffects();
++                    entityOverlays[t].setThreadIndex(t);
++                }
++
++                final int batchSize = Math.max(1, (entitiesToTick.size() + threadCount - 1) / threadCount);
++                final java.util.concurrent.CountDownLatch entityLatch =
++                    new java.util.concurrent.CountDownLatch(threadCount);
++                final java.util.concurrent.atomic.AtomicReference<Throwable> entityError =
++                    new java.util.concurrent.atomic.AtomicReference<>();
++
++                // Mica - capture entity position snapshots before parallel dispatch
++                for (Entity entity : entitiesToTick) {
++                    entity.micaCaptureSnapshot();
++                }
++
++                for (int t = 0; t < threadCount; t++) {
++                    final int threadIndex = t;
++                    final int start = t * batchSize;
++                    final int end = Math.min(start + batchSize, entitiesToTick.size());
++
++                    if (start >= entitiesToTick.size()) {
++                        entityLatch.countDown();
++                        continue;
++                    }
++
++                    final net.minecraft.server.level.mica.TrackedOverlay overlay = entityOverlays[t];
++
++                    net.minecraft.server.level.ServerChunkCache.MICA_POOL.execute(() -> {
++                        try {
++                            ca.spottedleaf.moonrise.common.util.TickThread.micaParallelPhase.set(Boolean.TRUE);
++                            this.micaOverlay.set(overlay);
++                            net.minecraft.world.level.Level.micaDeferredStatic.set(overlay.deferredEffects);
++                            try {
++                                for (int curEntitiy = start; curEntitiy < end; curEntitiy++) {
++                                    Entity entity = entitiesToTick.get(curEntitiy);
++                                    if (entity.isRemoved()) continue;
++
++                                    net.minecraft.server.level.mica.OperationId opId =
++                                        net.minecraft.server.level.mica.OperationId.entityTick(
++                                            entity.getId(), threadIndex);
++                                    overlay.setCurrentOperation(opId);
++
++                                    // Vehicle checks
+                                     Entity vehicle = entity.getVehicle();
+                                     if (vehicle != null) {
+                                         if (!vehicle.isRemoved() && vehicle.hasPassenger(entity)) {
+-                                            return;
++                                            continue;
+                                         }
+-
+                                         entity.stopRiding();
+                                     }
+ 
+-                                    profilerFiller.push("tick");
+-                                    this.guardEntityTick(this::tickNonPassenger, entity);
+-                                    profilerFiller.pop();
++                                    // Tick the entity
++                                    try {
++                                        this.tickNonPassenger(entity);
++                                    } catch (Throwable t1) {
++                                        // Match guardEntityTick behavior — log and discard
++                                        String msg = String.format("Entity threw exception at %s:%s,%s,%s",
++                                            this.getWorld().getName(), entity.getX(), entity.getY(), entity.getZ());
++                                        net.minecraft.server.MinecraftServer.LOGGER.error(msg, t1);
++                                        entity.discard(org.bukkit.event.entity.EntityRemoveEvent.Cause.DISCARD);
++                                    }
+                                 }
++                            } finally {
++                                ca.spottedleaf.moonrise.common.util.TickThread.micaParallelPhase.set(Boolean.FALSE);
++                                this.micaOverlay.remove();
++                                net.minecraft.world.level.Level.micaDeferredStatic.remove();
+                             }
++                        } catch (Throwable t1) {
++                            entityError.compareAndSet(null, t1);
++                            net.minecraft.server.level.ServerChunkCache.MICA_LOGGER.error(
++                                "[Mica] Error in parallel entity tick on thread {}", threadIndex, t1);
++                        } finally {
++                            entityLatch.countDown();
+                         }
++                    });
++                }
++
++                try {
++                    entityLatch.await();
++                } catch (InterruptedException e) {
++                    Thread.currentThread().interrupt();
++                }
++
++                // Mica - clear entity snapshots
++                for (Entity entity : entitiesToTick) {
++                    entity.micaClearSnapshot();
++                }
++
++                // Apply block state writes from entity overlays
++                for (int t = 0; t < threadCount; t++) {
++                    for (var entry : entityOverlays[t].getBlockWrites().long2ObjectEntrySet()) {
++                        net.minecraft.core.BlockPos pos = net.minecraft.core.BlockPos.of(entry.getLongKey());
++                        net.minecraft.world.level.block.state.BlockState state = entry.getValue();
++                        this.setBlock(pos, state, net.minecraft.world.level.block.Block.UPDATE_ALL);
+                     }
+-                );
++                }
++
++                // Apply deferred effects on main thread
++                for (int t = 0; t < threadCount; t++) {
++                    net.minecraft.server.level.mica.DeferredEffects deferred = entityOverlays[t].deferredEffects;
++                    if (deferred != null && !deferred.isEmpty()) {
++                        deferred.apply(this);
++                    }
++                }
++
++                // Mica - entity tick stats
++                long entityTimeEnd = System.nanoTime();
++                this.micaEntityTickCount++;
++                if (this.micaEntityTickCount % 200 == 0) {
++                    int totalReads = 0, totalWrites = 0, totalDeferred = 0;
++                    for (int t = 0; t < threadCount; t++) {
++                        totalReads += entityOverlays[t].getReadCount();
++                        totalWrites += entityOverlays[t].getWriteCount();
++                        if (entityOverlays[t].deferredEffects != null) {
++                            totalDeferred += entityOverlays[t].deferredEffects.getSkippedEntitySpawnCount()
++                                + entityOverlays[t].deferredEffects.getSkippedEventCount();
++                        }
++                    }
++                    double msEntity = (entityTimeEnd - entityTimeStart) / 1_000_000.0;
++                    ServerChunkCache.MICA_LOGGER.info(
++                        "[Entities] {}ms | {} threads | {} entities | {} reads, {} writes, {} deferred",
++                        String.format("%.2f", msEntity),
++                        threadCount, entitiesToTick.size(), totalReads, totalWrites, totalDeferred);
++                }
++
++                if (entityError.get() != null) {
++                    net.minecraft.server.level.ServerChunkCache.MICA_LOGGER.error(
++                        "[Mica] Entity tick had errors, some entities may not have ticked");
++                }
++            }
++            // Mica end - parallel entity ticking
+             profilerFiller.popPush("blockEntities");
+             this.tickBlockEntities();
+             profilerFiller.pop();
+@@ -957,10 +1093,29 @@ public class ServerLevel extends Level implements ServerEntityGetter, WorldGenLe
+                 // do not use a mutable pos, as some random tick implementations store the input without calling immutable()!
+                 final BlockPos pos = new BlockPos((location & 15) | offsetX, ((location >>> (4 + 4)) & 15) | offsetY, ((location >>> 4) & 15) | offsetZ);
+ 
++                // Mica start - per-block operation tracking
++                net.minecraft.server.level.mica.TrackedOverlay overlay = this.micaOverlay.get();
++                if (overlay != null) {
++                    net.minecraft.server.level.mica.OperationId opId =
++                        net.minecraft.server.level.mica.OperationId.randomTick(pos, overlay.getThreadIndex());
++                    overlay.setCurrentOperation(opId);
++                    overlay.recordTick(opId, pos);
++                }
++                // Mica end
++
+                 state.randomTick((ServerLevel)(Object)this, pos, simpleRandom);
++
+                 if (doubleTickFluids) {
+                     final FluidState fluidState = state.getFluidState();
+                     if (fluidState.isRandomlyTicking()) {
++                        // Mica start - per-block operation tracking for fluids
++                        if (overlay != null) {
++                            net.minecraft.server.level.mica.OperationId fluidOpId =
++                                net.minecraft.server.level.mica.OperationId.fluidTick(pos, overlay.getThreadIndex());
++                            overlay.setCurrentOperation(fluidOpId);
++                            overlay.recordTick(fluidOpId, pos);
++                        }
++                        // Mica end
+                         fluidState.randomTick((ServerLevel)(Object)this, pos, simpleRandom);
+                     }
+                 }
+@@ -982,7 +1137,17 @@ public class ServerLevel extends Level implements ServerEntityGetter, WorldGenLe
+         if (!this.paperConfig().environment.disableIceAndSnow) { // Paper - Option to disable ice and snow
+         for (int i = 0; i < randomTickSpeed; i++) {
+             if (simpleRandom.nextInt(48) == 0) {  // Paper - optimise random ticking
+-                this.tickPrecipitation(this.getBlockRandomPos(minBlockX, 0, minBlockZ, 15));
++                // Mica start - per-block operation tracking for precipitation
++                net.minecraft.server.level.mica.TrackedOverlay overlay = this.micaOverlay.get();
++                BlockPos precipPos = this.getBlockRandomPos(minBlockX, 0, minBlockZ, 15);
++                if (overlay != null) {
++                    net.minecraft.server.level.mica.OperationId opId =
++                        net.minecraft.server.level.mica.OperationId.randomTick(precipPos, overlay.getThreadIndex());
++                    overlay.setCurrentOperation(opId);
++                    overlay.recordTick(opId, precipPos);
++                }
++                this.tickPrecipitation(precipPos);
++                // Mica end
+             }
+         }
+         } // Paper - Option to disable ice and snow
+@@ -1324,8 +1489,11 @@ public class ServerLevel extends Level implements ServerEntityGetter, WorldGenLe
+     }
+ 
+     // Paper start - log detailed entity tick information
+-    // TODO replace with varhandle
+-    static final java.util.concurrent.atomic.AtomicReference<Entity> currentlyTickingEntity = new java.util.concurrent.atomic.AtomicReference<>();
++    static final ThreadLocal<Entity> currentlyTickingEntity = new ThreadLocal<>();
++
++    public static Entity getCurrentlyTickingEntity() {
++        return currentlyTickingEntity.get();
++    }
+ 
+     public static List<Entity> getCurrentlyTickingEntities() {
+         Entity ticking = currentlyTickingEntity.get();
+@@ -1340,7 +1508,7 @@ public class ServerLevel extends Level implements ServerEntityGetter, WorldGenLe
+         ca.spottedleaf.moonrise.common.util.TickThread.ensureTickThread("Cannot tick an entity off-main");
+         try {
+             if (currentlyTickingEntity.get() == null) {
+-                currentlyTickingEntity.lazySet(entity);
++                currentlyTickingEntity.set(entity);
+             }
+             // Paper end - log detailed entity tick information
+         entity.setOldPosAndRot();
+@@ -1362,7 +1530,7 @@ public class ServerLevel extends Level implements ServerEntityGetter, WorldGenLe
+         // Paper start - log detailed entity tick information
+         } finally {
+             if (currentlyTickingEntity.get() == entity) {
+-                currentlyTickingEntity.lazySet(null);
++                currentlyTickingEntity.set(null);
+             }
+         }
+         // Paper end - log detailed entity tick information
+@@ -1600,6 +1768,15 @@ public class ServerLevel extends Level implements ServerEntityGetter, WorldGenLe
+     // CraftBukkit start
+     private boolean addEntity(Entity entity, org.bukkit.event.entity.CreatureSpawnEvent.@Nullable SpawnReason spawnReason) {
+         org.spigotmc.AsyncCatcher.catchOp("entity add"); // Spigot
++        // Mica start - buffer entity spawns during parallel tick processing
++        if (Thread.currentThread() instanceof java.util.concurrent.ForkJoinWorkerThread) {
++            net.minecraft.server.level.mica.DeferredEffects deferred = net.minecraft.world.level.Level.micaDeferredStatic.get();
++            if (deferred != null) {
++                deferred.addEntitySpawn(entity, spawnReason);
++                return true;
++            }
++        }
++        // Mica end
+         entity.generation = false; // Paper - Don't fire sync event during generation; Reset flag if it was added during a ServerLevel generation process
+         // Paper start - extra debug info
+         if (entity.valid) {
+@@ -1852,33 +2029,65 @@ public class ServerLevel extends Level implements ServerEntityGetter, WorldGenLe
+ 
+     @Override
+     public void updateNeighborsAt(BlockPos pos, Block block) {
+-        // CraftBukkit start
+-        if (this.populating) {
++        if (this.populating) return;
++        if (captureBlockStates) return;
++        // Mica start - use thread-local neighbor updater during parallel execution
++        CollectingNeighborUpdater micaUpdater = Level.micaNeighborUpdater.get();
++        if (micaUpdater != null) {
++            micaUpdater.updateNeighborsAtExceptFromFacing(pos, block, null,
++                net.minecraft.world.level.redstone.ExperimentalRedstoneUtils.initialOrientation(this, null, null));
+             return;
+         }
+-        // CraftBukkit end
+-        if (captureBlockStates) { return; } // Paper - Cancel all physics during placement
++        // Mica end
+         this.updateNeighborsAt(pos, block, ExperimentalRedstoneUtils.initialOrientation(this, null, null));
+     }
+ 
+     @Override
+     public void updateNeighborsAt(BlockPos pos, Block block, @Nullable Orientation orientation) {
+-        if (captureBlockStates) { return; } // Paper - Cancel all physics during placement
++        if (captureBlockStates) return;
++        // Mica start
++        CollectingNeighborUpdater micaUpdater = Level.micaNeighborUpdater.get();
++        if (micaUpdater != null) {
++            micaUpdater.updateNeighborsAtExceptFromFacing(pos, block, null, orientation);
++            return;
++        }
++        // Mica end
+         this.neighborUpdater.updateNeighborsAtExceptFromFacing(pos, block, null, orientation);
+     }
+ 
+     @Override
+     public void updateNeighborsAtExceptFromFacing(BlockPos pos, Block block, Direction facing, @Nullable Orientation orientation) {
++        // Mica start
++        CollectingNeighborUpdater micaUpdater = Level.micaNeighborUpdater.get();
++        if (micaUpdater != null) {
++            micaUpdater.updateNeighborsAtExceptFromFacing(pos, block, facing, orientation);
++            return;
++        }
++        // Mica end
+         this.neighborUpdater.updateNeighborsAtExceptFromFacing(pos, block, facing, orientation);
+     }
+ 
+     @Override
+     public void neighborChanged(BlockPos pos, Block block, @Nullable Orientation orientation) {
++        // Mica start
++        CollectingNeighborUpdater micaUpdater = Level.micaNeighborUpdater.get();
++        if (micaUpdater != null) {
++            micaUpdater.neighborChanged(pos, block, orientation);
++            return;
++        }
++        // Mica end
+         this.neighborUpdater.neighborChanged(pos, block, orientation);
+     }
+ 
+     @Override
+     public void neighborChanged(BlockState state, BlockPos pos, Block block, @Nullable Orientation orientation, boolean movedByPiston) {
++        // Mica start
++        CollectingNeighborUpdater micaUpdater = Level.micaNeighborUpdater.get();
++        if (micaUpdater != null) {
++            micaUpdater.neighborChanged(state, pos, block, orientation, movedByPiston);
++            return;
++        }
++        // Mica end
+         this.neighborUpdater.neighborChanged(state, pos, block, orientation, movedByPiston);
+     }
+ 
+diff --git a/net/minecraft/server/level/mica/DeferredEffects.java b/net/minecraft/server/level/mica/DeferredEffects.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..2cb6b22bf14449a8437de78bce84eb4a3368a6c6
+--- /dev/null
++++ b/net/minecraft/server/level/mica/DeferredEffects.java
+@@ -0,0 +1,100 @@
++package net.minecraft.server.level.mica;
++
++import net.minecraft.core.BlockPos;
++import net.minecraft.server.level.ServerLevel;
++import net.minecraft.world.entity.Entity;
++import net.minecraft.world.level.block.state.BlockState;
++import org.bukkit.event.Event;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++import java.util.ArrayList;
++import java.util.List;
++
++/**
++ * Buffers all side effects that occur during parallel tick processing
++ * and need to be applied on the main thread.
++ *
++ * Each worker thread gets one of these. After parallel execution completes,
++ * the main thread drains all buffers in order.
++ */
++public class DeferredEffects {
++
++    private static final Logger LOGGER = LoggerFactory.getLogger("Mica");
++
++    // Entity spawns (item drops from leaf decay, lightning bolts, etc.)
++    private final List<EntitySpawn> entitySpawns = new ArrayList<>();
++
++    // Bukkit events that were skipped during parallel execution
++    private final List<DeferredEvent> deferredEvents = new ArrayList<>();
++
++    // Sound/particle effects
++    private final List<Runnable> effects = new ArrayList<>();
++
++    // Generic deferred tasks (anything else we discover)
++    private final List<Runnable> deferredTasks = new ArrayList<>();
++
++    // Stats
++    private int skippedEventCount = 0;
++    private int skippedEntitySpawnCount = 0;
++    private int skippedOtherCount = 0;
++
++    public void addEntitySpawn(Entity entity, org.bukkit.event.entity.CreatureSpawnEvent.SpawnReason reason) {
++        this.entitySpawns.add(new EntitySpawn(entity, reason));
++        this.skippedEntitySpawnCount++;
++    }
++
++    public void addDeferredEvent(Event event) {
++        this.deferredEvents.add(new DeferredEvent(event));
++        this.skippedEventCount++;
++    }
++
++    public void addDeferredTask(Runnable task) {
++        this.deferredTasks.add(task);
++        this.skippedOtherCount++;
++    }
++
++    /**
++     * Apply all buffered effects to the world on the main thread.
++     */
++    public void apply(ServerLevel level) {
++        // Spawn deferred entities
++        for (EntitySpawn spawn : this.entitySpawns) {
++            level.addFreshEntity(spawn.entity(), spawn.reason());
++        }
++
++        // Fire deferred events
++        for (DeferredEvent event : this.deferredEvents) {
++            event.event().callEvent();
++        }
++
++        // Run deferred tasks
++        for (Runnable task : this.deferredTasks) {
++            task.run();
++        }
++    }
++
++    public void clear() {
++        this.entitySpawns.clear();
++        this.deferredEvents.clear();
++        this.effects.clear();
++        this.deferredTasks.clear();
++        this.skippedEventCount = 0;
++        this.skippedEntitySpawnCount = 0;
++        this.skippedOtherCount = 0;
++    }
++
++    public boolean isEmpty() {
++        return this.entitySpawns.isEmpty()
++            && this.deferredEvents.isEmpty()
++            && this.effects.isEmpty()
++            && this.deferredTasks.isEmpty();
++    }
++
++    public int getSkippedEventCount() { return this.skippedEventCount; }
++    public int getSkippedEntitySpawnCount() { return this.skippedEntitySpawnCount; }
++    public int getSkippedOtherCount() { return this.skippedOtherCount; }
++
++    public record EntitySpawn(Entity entity, org.bukkit.event.entity.CreatureSpawnEvent.SpawnReason reason) {}
++    public record DeferredEvent(Event event) {}
++}
+diff --git a/net/minecraft/server/level/mica/MicaTickEngine.java b/net/minecraft/server/level/mica/MicaTickEngine.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..cde4a7bc63c95c5b6856fff110046d2b10a4a09a
+--- /dev/null
++++ b/net/minecraft/server/level/mica/MicaTickEngine.java
+@@ -0,0 +1,216 @@
++// ============================================================================
++// 6. MicaTickEngine
++// ============================================================================
++//
++// Purpose: The main orchestrator. Replaces the serial tick execution
++// with the SCMC cycle:
++//   1. Snapshot
++//   2. Parallel compute with tracked overlays
++//   3. Merge overlays, detect conflicts
++//   4. Re-run tainted operations serially
++//   5. Apply final state to live world
++//
++// Initially this runs everything serially (Phase 0) to validate
++// the abstraction. Parallelism is enabled in Phase 1+.
++
++package net.minecraft.server.level.mica;
++
++import net.minecraft.core.BlockPos;
++import net.minecraft.server.level.ServerLevel;
++import net.minecraft.world.level.block.state.BlockState;
++import it.unimi.dsi.fastutil.longs.Long2ObjectMap;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++import java.util.*;
++import java.util.concurrent.ForkJoinPool;
++import java.util.concurrent.ForkJoinTask;
++
++public class MicaTickEngine {
++
++    private static final Logger LOGGER = LoggerFactory.getLogger("Mica");
++
++    // Max convergence iterations before we give up and accept the state
++    private static final int MAX_CONVERGENCE_ITERATIONS = 5;
++
++    private final ServerLevel level;
++    private final int threadCount;
++    private final ForkJoinPool workerPool;
++
++    // Reusable overlay pool to avoid allocation each tick
++    private final List<TrackedOverlay> overlayPool;
++
++    // Stats for monitoring
++    private long totalTicks = 0;
++    private long totalConflicts = 0;
++    private long totalTaintedOps = 0;
++    private long totalReRuns = 0;
++
++    public MicaTickEngine(ServerLevel level, int threadCount) {
++        this.level = level;
++        this.threadCount = threadCount;
++        this.workerPool = new ForkJoinPool(threadCount);
++
++        this.overlayPool = new ArrayList<>(threadCount);
++        // Pre-allocate overlays — they'll be populated with the snapshot each tick
++    }
++
++    /**
++     * Execute a set of operations using the SCMC model.
++     *
++     * @param operations The tick operations to execute
++     * @param executor   How to execute a single operation against an overlay
++     */
++    public void executeParallel(
++        List<TickOperation> operations,
++        OperationExecutor executor
++    ) {
++        if (operations.isEmpty()) return;
++
++        this.totalTicks++;
++
++        // --- Phase 1: Snapshot ---
++        WorldSnapshot snapshot = WorldSnapshot.capture(this.level);
++
++        // --- Phase 2: Parallel Compute ---
++        // Prepare overlays (one per thread)
++        while (this.overlayPool.size() < this.threadCount) {
++            this.overlayPool.add(new TrackedOverlay(snapshot));
++        }
++        for (TrackedOverlay overlay : this.overlayPool) {
++            overlay.clear();
++            // Note: overlay still references old snapshot, update it
++            // TODO: add setSnapshot() method to TrackedOverlay
++        }
++
++        // Dispatch operations to worker threads
++        // Each thread picks up operations from a shared queue
++        // and executes them against its thread-local overlay
++        List<ForkJoinTask<?>> tasks = new ArrayList<>();
++        int batchSize = Math.max(1, operations.size() / this.threadCount);
++
++        for (int t = 0; t < this.threadCount; t++) {
++            int start = t * batchSize;
++            int end = (t == this.threadCount - 1)
++                ? operations.size()
++                : Math.min(start + batchSize, operations.size());
++
++            if (start >= operations.size()) break;
++
++            final int threadIndex = t;
++            final TrackedOverlay overlay = this.overlayPool.get(t);
++            final List<TickOperation> batch = operations.subList(start, end);
++
++            tasks.add(this.workerPool.submit(() -> {
++                for (TickOperation op : batch) {
++                    OperationId opId = op.createId(threadIndex);
++                    overlay.setCurrentOperation(opId);
++                    executor.execute(op, overlay);
++                }
++            }));
++        }
++
++        // Wait for all workers to complete
++        for (ForkJoinTask<?> task : tasks) {
++            task.join();
++        }
++
++        // --- Phase 3: Merge ---
++        List<TrackedOverlay> activeOverlays = this.overlayPool.subList(
++            0, Math.min(this.threadCount, tasks.size())
++        );
++        OverlayMerger.MergeResult mergeResult = OverlayMerger.merge(activeOverlays);
++
++        this.totalConflicts += mergeResult.conflictCount();
++        this.totalTaintedOps += mergeResult.taintedOperationCount();
++
++        // --- Phase 4: Re-run tainted operations serially ---
++        if (!mergeResult.taintedOperations().isEmpty()) {
++            this.totalReRuns++;
++
++            LOGGER.debug("Mica: {} tainted operations from {} conflicts, re-running serially",
++                mergeResult.taintedOperationCount(), mergeResult.conflictCount());
++
++            // Create a fresh overlay that includes the clean writes
++            // so the serial re-run sees the non-conflicting results
++            TrackedOverlay rerunOverlay = new TrackedOverlay(snapshot);
++
++            // Apply clean writes to the rerun overlay so serial ops see them
++            for (var entry : mergeResult.cleanWrites().long2ObjectEntrySet()) {
++                rerunOverlay.setBlockState(
++                    BlockPos.of(entry.getLongKey()),
++                    entry.getValue()
++                );
++            }
++
++            // Find and re-run tainted operations in original order
++            for (TickOperation op : operations) {
++                OperationId testId = op.createId(0); // thread index doesn't matter for matching
++                // Check if this operation's type+source matches any tainted op
++                if (isTainted(testId, mergeResult.taintedOperations())) {
++                    rerunOverlay.setCurrentOperation(testId);
++                    executor.execute(op, rerunOverlay);
++                }
++            }
++
++            // Merge rerun overlay writes into clean writes
++            for (var entry : rerunOverlay.getBlockWrites().long2ObjectEntrySet()) {
++                mergeResult.cleanWrites().put(entry.getLongKey(), entry.getValue());
++            }
++        }
++
++        // --- Phase 5: Apply to live world ---
++        applyToWorld(this.level, mergeResult.cleanWrites());
++    }
++
++    /**
++     * Check if an operation matches any tainted operation.
++     * We match on type and source position, ignoring thread index.
++     */
++    private static boolean isTainted(OperationId candidate, Set<OperationId> tainted) {
++        for (OperationId t : tainted) {
++            if (t.type() == candidate.type() && t.sourcePos() == candidate.sourcePos()) {
++                return true;
++            }
++        }
++        return false;
++    }
++
++    /**
++     * Apply merged block state changes to the live world.
++     * This is the single-threaded commit phase.
++     */
++    private static void applyToWorld(ServerLevel level, Long2ObjectMap<BlockState> writes) {
++        for (var entry : writes.long2ObjectEntrySet()) {
++            BlockPos pos = BlockPos.of(entry.getLongKey());
++            BlockState newState = entry.getValue();
++
++            // Use the level's setBlock to trigger all the normal
++            // side effects (lighting updates, chunk dirty marking, etc.)
++            // The flags argument controls which side effects fire.
++            // Block.UPDATE_ALL = notify neighbors + clients
++            level.setBlock(pos, newState, net.minecraft.world.level.block.Block.UPDATE_ALL);
++        }
++    }
++
++    // --- Stats accessors ---
++
++    public long getTotalTicks() { return this.totalTicks; }
++    public long getTotalConflicts() { return this.totalConflicts; }
++    public long getTotalTaintedOps() { return this.totalTaintedOps; }
++    public long getTotalReRuns() { return this.totalReRuns; }
++
++    public double getConflictRate() {
++        return this.totalTicks == 0 ? 0.0 : (double) this.totalConflicts / this.totalTicks;
++    }
++
++    public void logStats() {
++        LOGGER.info("Mica stats: {} ticks, {} total conflicts ({} avg/tick), {} re-run phases",
++            this.totalTicks, this.totalConflicts,
++            String.format("%.2f", this.getConflictRate()),
++            this.totalReRuns);
++    }
++
++    public void shutdown() {
++        this.workerPool.shutdown();
++    }
++}
+diff --git a/net/minecraft/server/level/mica/OperationExecutor.java b/net/minecraft/server/level/mica/OperationExecutor.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..27ee343395e8b355092506a16a2bb0ba104866eb
+--- /dev/null
++++ b/net/minecraft/server/level/mica/OperationExecutor.java
+@@ -0,0 +1,22 @@
++// ============================================================================
++// 8. OperationExecutor
++// ============================================================================
++//
++// Purpose: Functional interface for executing an operation against an overlay.
++// The implementation contains the actual game logic — calling
++// blockState.tick(), entity.tick(), etc. against the overlay
++// instead of the live world.
++
++package net.minecraft.server.level.mica;
++
++@FunctionalInterface
++public interface OperationExecutor {
++    /**
++     * Execute a single tick operation using the given overlay for
++     * world reads and writes.
++     *
++     * @param operation The operation to execute
++     * @param overlay   The tracked overlay to read from / write to
++     */
++    void execute(TickOperation operation, TrackedOverlay overlay);
++}
+diff --git a/net/minecraft/server/level/mica/OperationId.java b/net/minecraft/server/level/mica/OperationId.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..1611e850b23243c3b398fd91f65382f741baff7d
+--- /dev/null
++++ b/net/minecraft/server/level/mica/OperationId.java
+@@ -0,0 +1,59 @@
++// ============================================================================
++// 3. OperationId
++// ============================================================================
++//
++// Purpose: Unique identifier for a single tick operation.
++// Used for provenance tracking — "which operation read/wrote this position?"
++// Lightweight value object.
++
++package net.minecraft.server.level.mica;
++
++import net.minecraft.core.BlockPos;
++
++public record OperationId(
++    OperationType type,
++    long sourcePos,      // packed BlockPos or entity ID, depending on type
++    int threadIndex      // which worker thread ran this operation
++) {
++    /**
++     * Create an ID for a scheduled block tick operation.
++     */
++    public static OperationId blockTick(BlockPos pos, int threadIndex) {
++        return new OperationId(OperationType.BLOCK_TICK, pos.asLong(), threadIndex);
++    }
++
++    /**
++     * Create an ID for a chunk tick operation (random ticks, ice/snow).
++     */
++    public static OperationId chunkTick(long chunkPos, int threadIndex) {
++        return new OperationId(OperationType.CHUNK_TICK, chunkPos, threadIndex);
++    }
++
++    /**
++     * Create an ID for a scheduled fluid tick operation.
++     */
++    public static OperationId fluidTick(BlockPos pos, int threadIndex) {
++        return new OperationId(OperationType.FLUID_TICK, pos.asLong(), threadIndex);
++    }
++
++    /**
++     * Create an ID for a random block tick in a chunk.
++     */
++    public static OperationId randomTick(BlockPos pos, int threadIndex) {
++        return new OperationId(OperationType.RANDOM_TICK, pos.asLong(), threadIndex);
++    }
++
++    /**
++     * Create an ID for an entity tick.
++     */
++    public static OperationId entityTick(int entityId, int threadIndex) {
++        return new OperationId(OperationType.ENTITY_TICK, entityId, threadIndex);
++    }
++
++    /**
++     * Create an ID for a block entity tick.
++     */
++    public static OperationId blockEntityTick(BlockPos pos, int threadIndex) {
++        return new OperationId(OperationType.BLOCK_ENTITY_TICK, pos.asLong(), threadIndex);
++    }
++}
+diff --git a/net/minecraft/server/level/mica/OperationType.java b/net/minecraft/server/level/mica/OperationType.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..b0aa951f207182086e9ae09812b04fa545b4980a
+--- /dev/null
++++ b/net/minecraft/server/level/mica/OperationType.java
+@@ -0,0 +1,16 @@
++// ============================================================================
++// 4. OperationType
++// ============================================================================
++
++package net.minecraft.server.level.mica;
++
++public enum OperationType {
++    BLOCK_TICK,
++    FLUID_TICK,
++    RANDOM_TICK,
++    ENTITY_TICK,
++    BLOCK_ENTITY_TICK,
++    CHUNK_TICK,       // ice/snow/lightning
++    MOB_SPAWN,
++    PLAYER_ACTION
++}
+diff --git a/net/minecraft/server/level/mica/OverlayMerger.java b/net/minecraft/server/level/mica/OverlayMerger.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..8955032d864a9b5f1686481c1cc4fe337dba9f44
+--- /dev/null
++++ b/net/minecraft/server/level/mica/OverlayMerger.java
+@@ -0,0 +1,180 @@
++// ============================================================================
++// 5. OverlayMerger
++// ============================================================================
++//
++// Purpose: Takes multiple TrackedOverlays from parallel workers,
++// detects conflicts, identifies tainted operations via provenance
++// graph walking, and produces either a clean merged result or
++// a set of operations that need serial re-execution.
++
++package net.minecraft.server.level.mica;
++
++import net.minecraft.world.level.block.state.BlockState;
++import it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap;
++import it.unimi.dsi.fastutil.longs.Long2ObjectMap;
++import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
++import java.util.*;
++
++public class OverlayMerger {
++
++    public record MergeResult(
++        // Clean writes that can be applied directly (no conflicts)
++        Long2ObjectMap<BlockState> cleanWrites,
++
++        // Operations that had conflicts and need serial re-execution
++        Set<OperationId> taintedOperations,
++
++        // Stats
++        int totalWrites,
++        int conflictCount,
++        int taintedOperationCount
++    ) {}
++
++    /**
++     * Merge multiple overlays, detect conflicts, and identify tainted operations.
++     *
++     * @param overlays The overlays from all worker threads
++     * @return MergeResult with clean writes and tainted operations
++     */
++    public static MergeResult merge(List<TrackedOverlay> overlays) {
++
++        // === Step 1: Find conflicting write positions ===
++        Long2IntOpenHashMap writeCountByPos = new Long2IntOpenHashMap();
++        writeCountByPos.defaultReturnValue(0);
++        Long2IntOpenHashMap singleWriterOverlay = new Long2IntOpenHashMap();
++        singleWriterOverlay.defaultReturnValue(-1);
++
++        int totalWritePositions = 0;
++
++        for (int i = 0; i < overlays.size(); i++) {
++            for (long pos : overlays.get(i).getBlockWrites().keySet()) {
++                int count = writeCountByPos.addTo(pos, 1);
++                if (count == 0) {
++                    singleWriterOverlay.put(pos, i);
++                    totalWritePositions++;
++                } else {
++                    singleWriterOverlay.remove(pos);
++                }
++            }
++        }
++
++        // === Fast path: no writes at all ===
++        if (totalWritePositions == 0) {
++            return new MergeResult(
++                new Long2ObjectOpenHashMap<>(),
++                new HashSet<>(),
++                0, 0, 0
++            );
++        }
++
++        // === Step 2: Separate clean writes from write-write conflicts ===
++        Long2ObjectMap<BlockState> cleanWrites = new Long2ObjectOpenHashMap<>();
++        Set<OperationId> taintedOps = new HashSet<>();
++        int conflictCount = 0;
++
++        for (var entry : singleWriterOverlay.long2IntEntrySet()) {
++            long pos = entry.getLongKey();
++            int overlayIndex = entry.getIntValue();
++            cleanWrites.put(pos, overlays.get(overlayIndex).getBlockWrites().get(pos));
++        }
++
++        for (var entry : writeCountByPos.long2IntEntrySet()) {
++            if (entry.getIntValue() > 1) {
++                long pos = entry.getLongKey();
++                conflictCount++;
++                for (TrackedOverlay overlay : overlays) {
++                    OperationId writer = overlay.getWriteProvenance().get(pos);
++                    if (writer != null) {
++                        taintedOps.add(writer);
++                    }
++                }
++            }
++        }
++
++        // === Step 3: Check for read-write conflicts ===
++        // Iterate writes (small set) and check if other overlays read those positions
++        for (int i = 0; i < overlays.size(); i++) {
++            TrackedOverlay writerOverlay = overlays.get(i);
++            for (var writeEntry : writerOverlay.getWriteProvenance().long2ObjectEntrySet()) {
++                long pos = writeEntry.getLongKey();
++                OperationId writer = writeEntry.getValue();
++
++                for (int j = 0; j < overlays.size(); j++) {
++                    if (i == j) continue;
++
++                    if (overlays.get(j).getReadPositions().contains(pos)) {
++                        // Taint the writer
++                        taintedOps.add(writer);
++
++                        // Find exactly which operations on the reading overlay read this position
++                        for (TrackedOverlay.ReadRecord record : overlays.get(j).getOperationReads()) {
++                            if (record.pos() == pos) {
++                                taintedOps.add(record.opId());
++                            }
++                        }
++                    }
++                }
++            }
++        }
++
++        // === Early exit: nothing tainted ===
++        if (taintedOps.isEmpty()) {
++            return new MergeResult(
++                cleanWrites,
++                taintedOps,
++                writeCountByPos.size(),
++                conflictCount,
++                0
++            );
++        }
++
++        // === Step 4: Transitive closure via targeted BFS ===
++        java.util.ArrayDeque<OperationId> worklist = new java.util.ArrayDeque<>(taintedOps);
++
++        while (!worklist.isEmpty()) {
++            OperationId tainted = worklist.poll();
++
++            // Find positions this tainted operation wrote to
++            for (TrackedOverlay overlay : overlays) {
++                for (var entry : overlay.getWriteProvenance().long2ObjectEntrySet()) {
++                    if (!entry.getValue().equals(tainted)) continue;
++
++                    long pos = entry.getLongKey();
++
++                    // Find operations that read this position across all overlays
++                    for (TrackedOverlay readerOverlay : overlays) {
++                        for (TrackedOverlay.ReadRecord record : readerOverlay.getOperationReads()) {
++                            if (record.pos() == pos && !taintedOps.contains(record.opId())) {
++                                taintedOps.add(record.opId());
++                                worklist.add(record.opId());
++                            }
++                        }
++                    }
++                }
++            }
++        }
++
++        // === Step 5: Remove tainted operations' writes from clean writes ===
++        for (TrackedOverlay overlay : overlays) {
++            for (var entry : overlay.getWriteProvenance().long2ObjectEntrySet()) {
++                if (taintedOps.contains(entry.getValue())) {
++                    cleanWrites.remove(entry.getLongKey());
++                }
++            }
++        }
++
++        return new MergeResult(
++            cleanWrites,
++            taintedOps,
++            writeCountByPos.size(),
++            conflictCount,
++            taintedOps.size()
++        );
++    }
++
++    private record WriteEntry(
++        int overlayIndex,
++        BlockState state,
++        OperationId source
++    ) {}
++}
+diff --git a/net/minecraft/server/level/mica/TickOperation.java b/net/minecraft/server/level/mica/TickOperation.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..cacc1b1263c58170dd47553ffc39d2f7182afd56
+--- /dev/null
++++ b/net/minecraft/server/level/mica/TickOperation.java
+@@ -0,0 +1,93 @@
++
++// ============================================================================
++// 7. TickOperation
++// ============================================================================
++//
++// Purpose: Represents a single unit of work that can be dispatched
++// to a worker thread. Wraps a scheduled tick, entity tick, etc.
++
++package net.minecraft.server.level.mica;
++
++import net.minecraft.core.BlockPos;
++
++public abstract class TickOperation {
++
++    /**
++     * Create an OperationId for this operation.
++     */
++    public abstract OperationId createId(int threadIndex);
++
++    // --- Concrete subtypes ---
++
++    public static class BlockTickOp extends TickOperation {
++        private final BlockPos pos;
++        private final net.minecraft.world.level.block.Block block;
++
++        public BlockTickOp(BlockPos pos, net.minecraft.world.level.block.Block block) {
++            this.pos = pos;
++            this.block = block;
++        }
++
++        @Override
++        public OperationId createId(int threadIndex) {
++            return OperationId.blockTick(this.pos, threadIndex);
++        }
++
++        public BlockPos getPos() { return this.pos; }
++        public net.minecraft.world.level.block.Block getBlock() { return this.block; }
++    }
++
++    public static class FluidTickOp extends TickOperation {
++        private final BlockPos pos;
++        private final net.minecraft.world.level.material.Fluid fluid;
++
++        public FluidTickOp(BlockPos pos, net.minecraft.world.level.material.Fluid fluid) {
++            this.pos = pos;
++            this.fluid = fluid;
++        }
++
++        @Override
++        public OperationId createId(int threadIndex) {
++            return OperationId.fluidTick(this.pos, threadIndex);
++        }
++
++        public BlockPos getPos() { return this.pos; }
++        public net.minecraft.world.level.material.Fluid getFluid() { return this.fluid; }
++    }
++
++    public static class EntityTickOp extends TickOperation {
++        private final net.minecraft.world.entity.Entity entity;
++
++        public EntityTickOp(net.minecraft.world.entity.Entity entity) {
++            this.entity = entity;
++        }
++
++        @Override
++        public OperationId createId(int threadIndex) {
++            return OperationId.entityTick(this.entity.getId(), threadIndex);
++        }
++
++        public net.minecraft.world.entity.Entity getEntity() { return this.entity; }
++    }
++
++    public static class BlockEntityTickOp extends TickOperation {
++        private final BlockPos pos;
++        private final net.minecraft.world.level.block.entity.TickingBlockEntity ticker;
++
++        public BlockEntityTickOp(BlockPos pos,
++                                 net.minecraft.world.level.block.entity.TickingBlockEntity ticker) {
++            this.pos = pos;
++            this.ticker = ticker;
++        }
++
++        @Override
++        public OperationId createId(int threadIndex) {
++            return OperationId.blockEntityTick(this.pos, threadIndex);
++        }
++
++        public BlockPos getPos() { return this.pos; }
++        public net.minecraft.world.level.block.entity.TickingBlockEntity getTicker() {
++            return this.ticker;
++        }
++    }
++}
+diff --git a/net/minecraft/server/level/mica/TrackedOverlay.java b/net/minecraft/server/level/mica/TrackedOverlay.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..4cc6afede00a2b37f59f03c7ab28c7d073622a1d
+--- /dev/null
++++ b/net/minecraft/server/level/mica/TrackedOverlay.java
+@@ -0,0 +1,216 @@
++
++
++// ============================================================================
++// 2. TrackedOverlay
++// ============================================================================
++//
++// Purpose: Thread-local read-write layer on top of the snapshot.
++// Reads check the overlay first, then fall through to the snapshot.
++// Writes go into the overlay only.
++// All reads and writes are tracked for provenance (which operation
++// caused them) so we can do precise conflict detection.
++//
++// Each worker thread gets one of these. Operations on the same thread
++// share the overlay, which means intra-thread cascades (neighborChanged)
++// naturally see each other's writes — exactly like vanilla's serial behavior.
++
++package net.minecraft.server.level.mica;
++
++import net.minecraft.core.BlockPos;
++import net.minecraft.world.level.BlockGetter;
++import net.minecraft.world.level.block.entity.BlockEntity;
++import net.minecraft.world.level.block.state.BlockState;
++import net.minecraft.world.level.material.FluidState;
++import it.unimi.dsi.fastutil.longs.Long2ObjectMap;
++import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
++import java.util.HashSet;
++import java.util.Set;
++import org.jspecify.annotations.Nullable;
++
++public class TrackedOverlay implements BlockGetter {
++
++    private WorldSnapshot snapshot;
++
++    // Block state writes: packed position -> new state
++    // Using long key for performance (BlockPos.asLong())
++    private final Long2ObjectMap<BlockState> blockWrites = new Long2ObjectOpenHashMap<>();
++
++    // Provenance tracking: for each written position, which operation wrote it
++    private final Long2ObjectMap<OperationId> writeProvenance = new Long2ObjectOpenHashMap<>();
++
++    // Read tracking: for the current operation, which positions were read
++    // Reset when we start a new operation on this thread
++    private final Long2ObjectMap<Set<OperationId>> readProvenance = new Long2ObjectOpenHashMap<>();
++
++    // The operation currently being executed on this thread
++    private @Nullable OperationId currentOperation;
++
++    public DeferredEffects deferredEffects;
++
++    // Stats for debugging/profiling
++    private int readCount = 0;
++    private int writeCount = 0;
++    private int overlayHitCount = 0;
++
++    // Thread index for this overlay
++    private int threadIndex;
++
++    // Record of every block that was random-ticked, so we can re-run specific ones
++    private final java.util.List<TickRecord> tickRecords = new java.util.ArrayList<>();
++
++    public record ReadRecord(OperationId opId, long pos) {}
++
++    private final java.util.List<ReadRecord> operationReads = new java.util.ArrayList<>();
++    private final it.unimi.dsi.fastutil.longs.LongOpenHashSet readPositions = new it.unimi.dsi.fastutil.longs.LongOpenHashSet();
++
++    public TrackedOverlay(WorldSnapshot snapshot) {
++        this.snapshot = snapshot;
++    }
++
++
++    public void setThreadIndex(int threadIndex) {
++        this.threadIndex = threadIndex;
++    }
++
++    public int getThreadIndex() {
++        return this.threadIndex;
++    }
++
++    public void recordTick(OperationId opId, BlockPos pos) {
++        this.tickRecords.add(new TickRecord(opId, pos.immutable()));
++    }
++
++    public java.util.List<TickRecord> getTickRecords() {
++        return this.tickRecords;
++    }
++
++    public record TickRecord(OperationId opId, BlockPos pos) {}
++
++    /**
++     * Set the current operation context.
++     * Called before each operation starts executing on this thread.
++     * All subsequent reads/writes are attributed to this operation.
++     */
++    public void setCurrentOperation(OperationId operation) {
++        this.currentOperation = operation;
++    }
++
++    public void setSnapshot(WorldSnapshot snapshot) {
++        this.snapshot = snapshot;
++    }
++
++    @Override
++    public BlockState getBlockState(BlockPos pos) {
++        long packed = pos.asLong();
++        this.readCount++;
++        this.readPositions.add(packed);
++
++        if (this.currentOperation != null) {
++            this.operationReads.add(new ReadRecord(this.currentOperation, packed));
++        }
++
++        BlockState overlayState = this.blockWrites.get(packed);
++        if (overlayState != null) {
++            this.overlayHitCount++;
++            return overlayState;
++        }
++
++        return this.snapshot.getBlockState(pos);
++    }
++
++    @Override
++    public FluidState getFluidState(BlockPos pos) {
++        return this.getBlockState(pos).getFluidState();
++    }
++
++    @Override
++    public @Nullable FluidState getFluidIfLoaded(BlockPos pos) {
++        return this.getFluidState(pos);
++    }
++
++    @Override
++    public @Nullable BlockEntity getBlockEntity(BlockPos pos) {
++        // TODO: overlay block entity state
++        return this.snapshot.getBlockEntity(pos);
++    }
++
++    @Override
++    public @Nullable BlockState getBlockStateIfLoaded(BlockPos pos) {
++        return this.getBlockState(pos);
++    }
++
++    @Override
++    public int getHeight() {
++        return this.snapshot.getHeight();
++    }
++
++    @Override
++    public int getMinY() {
++        return this.snapshot.getMinY();
++    }
++
++    /**
++     * Write a block state change into the overlay.
++     * This does NOT modify the snapshot or the live world.
++     * The change is only visible to subsequent reads on THIS thread.
++     */
++    public void setBlockState(BlockPos pos, BlockState state) {
++        long packed = pos.asLong();
++        this.blockWrites.put(packed, state);
++        this.writeCount++;
++
++        if (this.currentOperation != null) {
++            this.writeProvenance.put(packed, this.currentOperation);
++        }
++    }
++
++    /**
++     * Check if this overlay has written to a specific position.
++     */
++    public boolean hasWrite(long packedPos) {
++        return this.blockWrites.containsKey(packedPos);
++    }
++
++    // --- Accessors for merge phase ---
++
++    public Long2ObjectMap<BlockState> getBlockWrites() {
++        return this.blockWrites;
++    }
++
++    public Long2ObjectMap<OperationId> getWriteProvenance() {
++        return this.writeProvenance;
++    }
++
++    public Long2ObjectMap<Set<OperationId>> getReadProvenance() {
++        return this.readProvenance;
++    }
++
++    public int getReadCount() { return this.readCount; }
++    public int getWriteCount() { return this.writeCount; }
++    public int getOverlayHitCount() { return this.overlayHitCount; }
++
++    public it.unimi.dsi.fastutil.longs.LongOpenHashSet getReadPositions() {
++        return this.readPositions;
++    }
++
++    public java.util.List<ReadRecord> getOperationReads() {
++        return this.operationReads;
++    }
++
++    /**
++     * Clear the overlay for reuse.
++     */
++    public void clear() {
++        this.blockWrites.clear();
++        this.writeProvenance.clear();
++        this.readProvenance.clear();
++        this.readPositions.clear();
++        this.operationReads.clear();
++        this.currentOperation = null;
++        this.threadIndex = 0;
++        this.tickRecords.clear();
++        this.readCount = 0;
++        this.writeCount = 0;
++        this.overlayHitCount = 0;
++    }
++}
+diff --git a/net/minecraft/server/level/mica/WorldSnapshot.java b/net/minecraft/server/level/mica/WorldSnapshot.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..4ff12015810d1f21e664d81292d7b835bd5dbb6e
+--- /dev/null
++++ b/net/minecraft/server/level/mica/WorldSnapshot.java
+@@ -0,0 +1,178 @@
++// ============================================================================
++// WorldSnapshot
++// ============================================================================
++//
++// Purpose: Immutable view of world state at tick start.
++// All parallel workers read from this. Nobody writes to it.
++//
++// Key design decision: We don't deep-copy the world. We use Copy-on-Write
++// at the chunk section level. At tick start, we flag all loaded chunk
++// sections as COW. If the merge phase (or anything else) needs to write
++// to a section, it copies it first. Snapshot readers always see the
++// original data.
++//
++// Implements BlockGetter so existing Minecraft code that reads block state
++// can accept it without modification.
++
++package net.minecraft.server.level.mica;
++
++import net.minecraft.core.BlockPos;
++import net.minecraft.world.level.BlockGetter;
++import net.minecraft.world.level.block.entity.BlockEntity;
++import net.minecraft.world.level.block.state.BlockState;
++import net.minecraft.world.level.chunk.LevelChunk;
++import net.minecraft.world.level.chunk.LevelChunkSection;
++import net.minecraft.world.level.material.FluidState;
++import net.minecraft.server.level.ServerLevel;
++import it.unimi.dsi.fastutil.longs.Long2ObjectMap;
++import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
++import org.jspecify.annotations.Nullable;
++
++public class WorldSnapshot implements BlockGetter {
++
++    // Snapshotted chunk sections, keyed by chunk pos
++    // Each entry holds references to the section arrays AT THE TIME of snapshot
++    // These references become stale if the live world modifies them,
++    // but that's the point — we want the old data
++    private final Long2ObjectMap<LevelChunkSection[]> sectionSnapshots;
++
++    // Reference to the live world for data we don't snapshot
++    // (biomes, heightmaps, light — these change rarely mid-tick
++    // and are expensive to snapshot)
++    private final ServerLevel level;
++
++    // The game tick this snapshot represents
++    private final long gameTick;
++
++    private WorldSnapshot(ServerLevel level, long gameTick,
++                          Long2ObjectMap<LevelChunkSection[]> sectionSnapshots) {
++        this.level = level;
++        this.gameTick = gameTick;
++        this.sectionSnapshots = sectionSnapshots;
++    }
++
++    /**
++     * Create a snapshot of the current world state.
++     *
++     * This is O(number of loaded chunks) but very fast —
++     * we're just copying array references, not block data.
++     * Each LevelChunkSection is ~8KB of palette-compressed data;
++     * we only reference it, not copy it.
++     */
++    public static WorldSnapshot capture(ServerLevel level) {
++        long gameTick = level.getGameTime();
++        Long2ObjectMap<LevelChunkSection[]> sections = new Long2ObjectOpenHashMap<>();
++
++        // Iterate all entity-ticking chunks (the ones that get ticked)
++        // Paper gives us direct array access for performance
++        var tickingChunks = level.moonrise$getEntityTickingChunks();
++        LevelChunk[] raw = tickingChunks.getRawDataUnchecked();
++        int size = tickingChunks.size();
++
++        for (int i = 0; i < size; i++) {
++            LevelChunk chunk = raw[i];
++            long chunkKey = chunk.getPos().toLong();
++
++            // Snapshot the section array reference
++            // IMPORTANT: We store a reference to the SAME array.
++            // If we later need COW, we clone at that point.
++            LevelChunkSection[] original = chunk.getSections();
++            LevelChunkSection[] copy = new LevelChunkSection[original.length];
++            System.arraycopy(original, 0, copy, 0, original.length);
++            sections.put(chunkKey, copy);
++        }
++
++        return new WorldSnapshot(level, gameTick, sections);
++    }
++
++    @Override
++    public @Nullable BlockState getBlockState(BlockPos pos) {
++        int chunkX = pos.getX() >> 4;
++        int chunkZ = pos.getZ() >> 4;
++        long chunkKey = ((long) chunkX & 0xFFFFFFFFL) | (((long) chunkZ & 0xFFFFFFFFL) << 32);
++
++        LevelChunkSection[] sections = this.sectionSnapshots.get(chunkKey);
++        if (sections == null) {
++            // Chunk not in snapshot — fall back to live world
++            // This handles edge cases where an operation reads beyond
++            // the ticking chunk radius
++
++            // Bypass Level.getBlockState() to avoid hitting the Mica overlay intercept
++            LevelChunk chunk = this.level.getChunkSource().getChunkAtIfLoadedImmediately(pos.getX() >> 4, pos.getZ() >> 4);
++            if (chunk != null) {
++                return chunk.getBlockState(pos);
++            }
++            return net.minecraft.world.level.block.Blocks.AIR.defaultBlockState();
++        }
++
++        int sectionIndex = level.getSectionIndex(pos.getY());
++        if (sectionIndex < 0 || sectionIndex >= sections.length) {
++            // Out of world bounds
++            return net.minecraft.world.level.block.Blocks.AIR.defaultBlockState();
++        }
++
++        LevelChunkSection section = sections[sectionIndex];
++        return section.getBlockState(
++            pos.getX() & 15,
++            pos.getY() & 15,
++            pos.getZ() & 15
++        );
++    }
++
++    @Override
++    public @Nullable FluidState getFluidState(BlockPos pos) {
++        BlockState state = this.getBlockState(pos);
++        return state.getFluidState();
++    }
++
++    @Override
++    public @Nullable FluidState getFluidIfLoaded(BlockPos pos) {
++        return this.getFluidState(pos);
++    }
++
++    @Override
++    public @Nullable BlockEntity getBlockEntity(BlockPos pos) {
++        // Block entities are more complex — for now, delegate to live world
++        // This is safe for snapshot reads because block entity state
++        // doesn't change during the compute phase
++        // TODO: Snapshot block entity state for full isolation
++        return this.level.getBlockEntity(pos);
++    }
++
++    @Override
++    public @Nullable BlockState getBlockStateIfLoaded(BlockPos pos) {
++        return this.getBlockState(pos);
++    }
++
++    @Override
++    public int getHeight() {
++        return this.level.getHeight();
++    }
++
++    @Override
++    public int getMinY() {
++        return this.level.getMinY();
++    }
++
++    public long getGameTick() {
++        return this.gameTick;
++    }
++
++    public ServerLevel getLevel() {
++        return this.level;
++    }
++}
++
++
++
++
++
++
++
++
++
++
++
++
++
++
+diff --git a/net/minecraft/world/entity/Entity.java b/net/minecraft/world/entity/Entity.java
+index 3bf618f1d756bad7755a87803132bd731e7c41be..2444063958cc52b0b6adeba7075e8d0f0ed11df4 100644
+--- a/net/minecraft/world/entity/Entity.java
++++ b/net/minecraft/world/entity/Entity.java
+@@ -376,6 +376,27 @@ public abstract class Entity implements SyncedDataHolder, DebugValueSource, Name
+ 
+     public void inactiveTick() {
+     }
++
++    // Mica start - entity state snapshot for parallel tick safety
++    public Vec3 micaSnapshotPos;
++    public AABB micaSnapshotBB;
++    public boolean micaSnapshotValid = false;
++    public BlockPos micaSnapshotBlockPos;
++    public @Nullable BlockState micaSnapshotInBlockState;
++
++    public void micaCaptureSnapshot() {
++        this.micaSnapshotPos = this.position;
++        this.micaSnapshotBB = this.bb;
++        this.micaSnapshotBlockPos = this.blockPosition;
++        this.micaSnapshotInBlockState = this.getInBlockState(); // force lazy init before snapshot
++        this.micaSnapshotValid = true;
++    }
++
++    public void micaClearSnapshot() {
++        this.micaSnapshotValid = false;
++    }
++    // Mica end
++
+     // Paper end - EAR 2
+     // CraftBukkit end
+ 
+@@ -802,7 +823,7 @@ public abstract class Entity implements SyncedDataHolder, DebugValueSource, Name
+     }
+ 
+     protected final AABB makeBoundingBox() {
+-        return this.makeBoundingBox(this.position);
++        return this.makeBoundingBox(this.position());
+     }
+ 
+     protected AABB makeBoundingBox(Vec3 position) {
+@@ -1451,13 +1472,13 @@ public abstract class Entity implements SyncedDataHolder, DebugValueSource, Name
+                 return (!(yOffset <= 0.5) || !blockState.is(BlockTags.FENCES))
+                         && !blockState.is(BlockTags.WALLS)
+                         && !(blockState.getBlock() instanceof FenceGateBlock)
+-                    ? blockPos.atY(Mth.floor(this.position.y - yOffset))
++                    ? blockPos.atY(Mth.floor(this.position().y - yOffset))
+                     : blockPos;
+             }
+         } else {
+-            int floor = Mth.floor(this.position.x);
+-            int floor1 = Mth.floor(this.position.y - yOffset);
+-            int floor2 = Mth.floor(this.position.z);
++            int floor = Mth.floor(this.position().x);
++            int floor1 = Mth.floor(this.position().y - yOffset);
++            int floor2 = Mth.floor(this.position().z);
+             return new BlockPos(floor, floor1, floor2);
+         }
+     }
+@@ -1807,7 +1828,7 @@ public abstract class Entity implements SyncedDataHolder, DebugValueSource, Name
+     }
+ 
+     public void gameEvent(Holder<GameEvent> gameEvent, @Nullable Entity entity) {
+-        this.level().gameEvent(entity, gameEvent, this.position);
++        this.level().gameEvent(entity, gameEvent, this.position());
+     }
+ 
+     public void gameEvent(Holder<GameEvent> gameEvent) {
+@@ -4448,6 +4469,11 @@ public abstract class Entity implements SyncedDataHolder, DebugValueSource, Name
+ 
+     @Override
+     public final AABB getBoundingBox() {
++        // Mica start
++        if (this.micaSnapshotValid && net.minecraft.server.level.ServerLevel.getCurrentlyTickingEntity() != this) {
++            return this.micaSnapshotBB;
++        }
++        // Mica end
+         return this.bb;
+     }
+ 
+@@ -4899,6 +4925,11 @@ public abstract class Entity implements SyncedDataHolder, DebugValueSource, Name
+ 
+     @Override
+     public Vec3 position() {
++        // Mica start
++        if (this.micaSnapshotValid && net.minecraft.server.level.ServerLevel.getCurrentlyTickingEntity() != this) {
++            return this.micaSnapshotPos;
++        }
++        // Mica end
+         return this.position;
+     }
+ 
+@@ -4908,14 +4939,23 @@ public abstract class Entity implements SyncedDataHolder, DebugValueSource, Name
+ 
+     @Override
+     public BlockPos blockPosition() {
++        // Mica start
++        if (this.micaSnapshotValid && net.minecraft.server.level.ServerLevel.getCurrentlyTickingEntity() != this) {
++            return this.micaSnapshotBlockPos;
++        }
++        // Mica end
+         return this.blockPosition;
+     }
+ 
+     public BlockState getInBlockState() {
++        // Mica start
++        if (this.micaSnapshotValid && net.minecraft.server.level.ServerLevel.getCurrentlyTickingEntity() != this) {
++            return this.micaSnapshotInBlockState;
++        }
++        // Mica end
+         if (this.inBlockState == null) {
+             this.inBlockState = this.level().getBlockState(this.blockPosition());
+         }
+-
+         return this.inBlockState;
+     }
+ 
+@@ -4946,15 +4986,22 @@ public abstract class Entity implements SyncedDataHolder, DebugValueSource, Name
+     }
+ 
+     public final int getBlockX() {
+-        return this.blockPosition.getX();
++        return this.blockPosition().getX();
+     }
+ 
+     public final double getX() {
++        // Mica start
++        if (this.micaSnapshotValid && net.minecraft.server.level.ServerLevel.getCurrentlyTickingEntity() != this) {
++            return this.micaSnapshotPos.x;
++        }
++        // Mica end
+         return this.position.x;
+     }
+ 
+     public double getX(double scale) {
+-        return this.position.x + this.getBbWidth() * scale;
++        // Mica start - pipe position evaluations through getters for thread safety.
++        return this.getX() + this.getBbWidth() * scale;
++        // Mica end
+     }
+ 
+     public double getRandomX(double scale) {
+@@ -4962,15 +5009,20 @@ public abstract class Entity implements SyncedDataHolder, DebugValueSource, Name
+     }
+ 
+     public final int getBlockY() {
+-        return this.blockPosition.getY();
++        return this.blockPosition().getY();
+     }
+ 
+     public final double getY() {
++        // Mica start
++        if (this.micaSnapshotValid && net.minecraft.server.level.ServerLevel.getCurrentlyTickingEntity() != this) {
++            return this.micaSnapshotPos.y;
++        }
++        // Mica end
+         return this.position.y;
+     }
+ 
+     public double getY(double scale) {
+-        return this.position.y + this.getBbHeight() * scale;
++        return this.getY() + this.getBbHeight() * scale;
+     }
+ 
+     public double getRandomY() {
+@@ -4978,19 +5030,24 @@ public abstract class Entity implements SyncedDataHolder, DebugValueSource, Name
+     }
+ 
+     public double getEyeY() {
+-        return this.position.y + this.eyeHeight;
++        return this.getY() + this.eyeHeight;
+     }
+ 
+     public final int getBlockZ() {
+-        return this.blockPosition.getZ();
++        return this.blockPosition().getZ();
+     }
+ 
+     public final double getZ() {
++        // Mica start
++        if (this.micaSnapshotValid && net.minecraft.server.level.ServerLevel.getCurrentlyTickingEntity() != this) {
++            return this.micaSnapshotPos.z;
++        }
++        // Mica end
+         return this.position.z;
+     }
+ 
+     public double getZ(double scale) {
+-        return this.position.z + this.getBbWidth() * scale;
++        return this.getZ() + this.getBbWidth() * scale;
+     }
+ 
+     public double getRandomZ(double scale) {
+diff --git a/net/minecraft/world/level/Level.java b/net/minecraft/world/level/Level.java
+index 579bbba4e823d4d0318e58759ca732b7c8e4d865..1b9ad765340c4615667f54c4d51303e59402562a 100644
+--- a/net/minecraft/world/level/Level.java
++++ b/net/minecraft/world/level/Level.java
+@@ -113,6 +113,14 @@ public abstract class Level implements LevelAccessor, AutoCloseable, ca.spottedl
+         .add(new ExplosionParticleInfo(ParticleTypes.SMOKE, 1.0F, 1.0F))
+         .build();
+     public final List<TickingBlockEntity> blockEntityTickers = Lists.newArrayList();
++
++    // Mica - SCMC thread-local overlay for parallel tick processing
++    public final ThreadLocal<net.minecraft.server.level.mica.TrackedOverlay> micaOverlay = new ThreadLocal<>();
++    public static final ThreadLocal<net.minecraft.server.level.mica.DeferredEffects> micaDeferredStatic = new ThreadLocal<>();
++
++    // Mica - per-thread neighbor updater for parallel block tick processing
++    public static final ThreadLocal<CollectingNeighborUpdater> micaNeighborUpdater = new ThreadLocal<>();
++
+     protected final CollectingNeighborUpdater neighborUpdater;
+     private final List<TickingBlockEntity> pendingBlockEntityTickers = Lists.newArrayList();
+     private boolean tickingBlockEntities;
+@@ -1043,6 +1051,52 @@ public abstract class Level implements LevelAccessor, AutoCloseable, ca.spottedl
+ 
+     @Override
+     public boolean setBlock(BlockPos pos, BlockState state, @Block.UpdateFlags int flags, int recursionLeft) {
++        // Mica start - redirect writes to overlay during parallel compute
++        net.minecraft.server.level.mica.TrackedOverlay overlay = this.micaOverlay.get();
++        if (overlay != null) {
++            if (!this.isInValidBounds(pos)) return false;
++
++            BlockState oldState = overlay.getBlockState(pos);
++            if (oldState == state) return false;
++
++            overlay.setBlockState(pos, state);
++
++            // Fire neighbor updates through thread-local updater
++            // These reads/writes go through the overlay automatically
++            if ((flags & Block.UPDATE_NEIGHBORS) != 0) {
++                CollectingNeighborUpdater updater = Level.micaNeighborUpdater.get();
++                if (updater != null) {
++                    updater.updateNeighborsAtExceptFromFacing(pos, state.getBlock(), null,
++                        net.minecraft.world.level.redstone.ExperimentalRedstoneUtils.initialOrientation(this, null, null));
++                    if (state.hasAnalogOutputSignal()) {
++                        this.updateNeighbourForOutputSignal(pos, state.getBlock());
++                    }
++                }
++            }
++
++            // Shape updates for adjacent blocks
++            if ((flags & Block.UPDATE_KNOWN_SHAPE) == 0 && recursionLeft > 0) {
++                int i = flags & ~(Block.UPDATE_SUPPRESS_DROPS | Block.UPDATE_NEIGHBORS);
++                oldState.updateIndirectNeighbourShapes(this, pos, i, recursionLeft - 1);
++                state.updateNeighbourShapes(this, pos, i, recursionLeft - 1);
++                state.updateIndirectNeighbourShapes(this, pos, i, recursionLeft - 1);
++            }
++
++            // Defer POI update to main thread
++            net.minecraft.server.level.mica.DeferredEffects deferred = Level.micaDeferredStatic.get();
++            if (deferred != null) {
++                final BlockState deferredOld = oldState;
++                final BlockState deferredNew = state;
++                final BlockPos deferredPos = pos.immutable();
++                deferred.addDeferredTask(() -> {
++                    this.updatePOIOnBlockStateChange(deferredPos, deferredOld, deferredNew);
++                });
++            }
++
++            return true;
++        }
++        // Mica end
++
+         // CraftBukkit start - tree generation
+         if (this.captureTreeGeneration) {
+             // Paper start - Protect Bedrock and End Portal/Frames from being destroyed
+@@ -1259,8 +1313,16 @@ public abstract class Level implements LevelAccessor, AutoCloseable, ca.spottedl
+ 
+     @Override
+     public void neighborShapeChanged(
+-        Direction direction, BlockPos pos, BlockPos neighborPos, BlockState neighborState, @Block.UpdateFlags int flags, int recursionLeft
++        Direction direction, BlockPos pos, BlockPos neighborPos, BlockState neighborState,
++        @Block.UpdateFlags int flags, int recursionLeft
+     ) {
++        // Mica start - use thread-local neighbor updater during parallel execution
++        CollectingNeighborUpdater micaUpdater = Level.micaNeighborUpdater.get();
++        if (micaUpdater != null) {
++            micaUpdater.shapeUpdate(direction, neighborState, pos, neighborPos, flags, recursionLeft);
++            return;
++        }
++        // Mica end
+         this.neighborUpdater.shapeUpdate(direction, neighborState, pos, neighborPos, flags, recursionLeft);
+     }
+ 
+@@ -1287,6 +1349,13 @@ public abstract class Level implements LevelAccessor, AutoCloseable, ca.spottedl
+ 
+     @Override
+     public BlockState getBlockState(BlockPos pos) {
++        // Mica start - redirect reads to overlay during parallel compute
++        net.minecraft.server.level.mica.TrackedOverlay overlay = this.micaOverlay.get();
++        if (overlay != null) {
++            return overlay.getBlockState(pos);
++        }
++        // Mica end
++
+         // CraftBukkit start - tree generation
+         if (this.captureTreeGeneration) {
+             CraftBlockState previous = this.capturedBlockStates.get(pos); // Paper
+@@ -1305,6 +1374,12 @@ public abstract class Level implements LevelAccessor, AutoCloseable, ca.spottedl
+ 
+     @Override
+     public FluidState getFluidState(BlockPos pos) {
++        // Mica start - redirect reads to overlay during parallel compute
++        net.minecraft.server.level.mica.TrackedOverlay overlay = this.micaOverlay.get();
++        if (overlay != null) {
++            return overlay.getFluidState(pos);
++        }
++        // Mica end
+         if (!this.isInValidBounds(pos)) {
+             return Fluids.EMPTY.defaultFluidState();
+         } else {
