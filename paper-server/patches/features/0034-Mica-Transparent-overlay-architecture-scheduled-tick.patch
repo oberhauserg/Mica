@@ -1,0 +1,1055 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grant Oberhauser <oberhausergrant@gmail.com>
+Date: Sun, 8 Mar 2026 18:41:25 -0700
+Subject: [PATCH] Mica: Transparent overlay architecture, scheduled ticke
+ parallism
+
+
+diff --git a/alternate/current/wire/LevelHelper.java b/alternate/current/wire/LevelHelper.java
+index ff663d3089627e75221aa128aff4bf5cc459addb..b48e6d7435af653224ee0a985e9650281a3b6861 100644
+--- a/alternate/current/wire/LevelHelper.java
++++ b/alternate/current/wire/LevelHelper.java
+@@ -27,6 +27,26 @@ class LevelHelper {
+      * omitted.
+      */
+     static boolean setWireState(ServerLevel level, BlockPos pos, BlockState state, boolean updateNeighborShapes) {
++        // Mica start - route through overlay during parallel execution
++        net.minecraft.server.level.mica.TrackedOverlay overlay = level.micaOverlay.get();
++        if (overlay != null) {
++            BlockState prevState = overlay.getBlockState(pos);
++            if (state == prevState) {
++                return false;
++            }
++            overlay.setBlockState(pos, state);
++
++            if (updateNeighborShapes) {
++                prevState.updateIndirectNeighbourShapes(level, pos, net.minecraft.world.level.block.Block.UPDATE_CLIENTS);
++                state.updateNeighbourShapes(level, pos, net.minecraft.world.level.block.Block.UPDATE_CLIENTS);
++                state.updateIndirectNeighbourShapes(level, pos, net.minecraft.world.level.block.Block.UPDATE_CLIENTS);
++            }
++
++            return true;
++        }
++        // Mica end
++
++
+         int y = pos.getY();
+ 
+         if (y < level.getMinY() || y > level.getMaxY()) {
+diff --git a/net/minecraft/server/level/ChunkMap.java b/net/minecraft/server/level/ChunkMap.java
+index ab8893163ac85971a470e4a4d6fa76bd174e2bae..45a0cd2fec15a1fd7695414d1043d2766383109d 100644
+--- a/net/minecraft/server/level/ChunkMap.java
++++ b/net/minecraft/server/level/ChunkMap.java
+@@ -1053,9 +1053,16 @@ public class ChunkMap extends SimpleRegionStorage implements ChunkHolder.PlayerP
+             if (tracker == null) {
+                 continue;
+             }
+-            ((ca.spottedleaf.moonrise.patches.entity_tracker.EntityTrackerTrackedEntity)tracker).moonrise$tick(((ca.spottedleaf.moonrise.patches.chunk_system.entity.ChunkSystemEntity)entity).moonrise$getChunkData().nearbyPlayers);
++            // Mica start - null check for deferred entity chunk moves
++            final var chunkData = ((ca.spottedleaf.moonrise.patches.chunk_system.entity.ChunkSystemEntity)entity).moonrise$getChunkData();
++            if (chunkData == null) {
++                continue;
++            }
++            ((ca.spottedleaf.moonrise.patches.entity_tracker.EntityTrackerTrackedEntity)tracker).moonrise$tick(chunkData.nearbyPlayers);
++            // Mica end
++
+             if (((ca.spottedleaf.moonrise.patches.entity_tracker.EntityTrackerTrackedEntity)tracker).moonrise$hasPlayers()
+-                || ((ca.spottedleaf.moonrise.patches.chunk_system.entity.ChunkSystemEntity)entity).moonrise$getChunkStatus().isOrAfter(FullChunkStatus.ENTITY_TICKING)) {
++                || (chunkData != null && ((ca.spottedleaf.moonrise.patches.chunk_system.entity.ChunkSystemEntity)entity).moonrise$getChunkStatus().isOrAfter(FullChunkStatus.ENTITY_TICKING))) {
+                 tracker.serverEntity.sendChanges();
+             }
+         }
+diff --git a/net/minecraft/server/level/ServerChunkCache.java b/net/minecraft/server/level/ServerChunkCache.java
+index a565abc66c1f7df61f6d55a95284fa42deeee950..d017d1f29e1ae32fa27c1fb78e8cd906e1747519 100644
+--- a/net/minecraft/server/level/ServerChunkCache.java
++++ b/net/minecraft/server/level/ServerChunkCache.java
+@@ -239,9 +239,12 @@ public class ServerChunkCache extends ChunkSource implements ca.spottedleaf.moon
+                     world.micaOverlay.set(overlay);
+                     CollectingNeighborUpdater threadUpdater = new CollectingNeighborUpdater(
+                         world,
+-                        world.getServer().getMaxChainedNeighborUpdates());
++                        world.getServer().getMaxChainedNeighborUpdates() * 4);
+                     Level.micaNeighborUpdater.set(threadUpdater);
+ 
++                    alternate.current.wire.WireHandler threadWireHandler = new alternate.current.wire.WireHandler(world);
++                    Level.micaWireHandler.set(threadWireHandler);
++
+                     net.minecraft.world.level.Level.micaDeferredStatic.set(overlay.deferredEffects);
+                     try {
+                         overlay.setThreadIndex(threadIndex);
+@@ -259,6 +262,7 @@ public class ServerChunkCache extends ChunkSource implements ca.spottedleaf.moon
+                     ca.spottedleaf.moonrise.common.util.TickThread.micaParallelPhase.set(Boolean.FALSE);
+                     world.micaOverlay.remove();
+                     Level.micaNeighborUpdater.remove();
++                    Level.micaWireHandler.remove();
+                     net.minecraft.world.level.Level.micaDeferredStatic.remove();
+                     latch.countDown();
+                 }
+@@ -355,8 +359,7 @@ public class ServerChunkCache extends ChunkSource implements ca.spottedleaf.moon
+         // --- Apply clean writes to live world ---
+         for (var entry : mergeResult.cleanWrites().long2ObjectEntrySet()) {
+             net.minecraft.core.BlockPos pos = net.minecraft.core.BlockPos.of(entry.getLongKey());
+-            net.minecraft.world.level.block.state.BlockState state = entry.getValue();
+-            world.setBlock(pos, state, net.minecraft.world.level.block.Block.UPDATE_ALL);
++            world.micaRawSetBlock(pos, entry.getValue());
+         }
+ 
+         // Apply deferred effects from parallel phase on main thread
+@@ -892,6 +895,13 @@ public class ServerChunkCache extends ChunkSource implements ca.spottedleaf.moon
+     }
+ 
+     public void blockChanged(BlockPos pos) {
++
++        // Mica start - suppress during parallel
++        if (Level.micaDeferredStatic.get() != null) {
++            return;
++        }
++        // Mica end
++
+         int sectionPosX = SectionPos.blockToSectionCoord(pos.getX());
+         int sectionPosZ = SectionPos.blockToSectionCoord(pos.getZ());
+         ChunkHolder visibleChunkIfPresent = this.getVisibleChunkIfPresent(ChunkPos.asLong(sectionPosX, sectionPosZ));
+diff --git a/net/minecraft/server/level/ServerLevel.java b/net/minecraft/server/level/ServerLevel.java
+index f1ae45545e87e396089ab4820ee03f41b0edca26..a1135dc02b24a36c230258cf1be30129a75de78f 100644
+--- a/net/minecraft/server/level/ServerLevel.java
++++ b/net/minecraft/server/level/ServerLevel.java
+@@ -751,7 +751,260 @@ public class ServerLevel extends Level implements ServerEntityGetter, WorldGenLe
+         return this.environmentAttributes;
+     }
+ 
++    // Mica start - raw block write for apply phase, no game logic triggers
++    public void micaRawSetBlock(BlockPos pos, BlockState state) {
++        LevelChunk chunk = this.getChunkAt(pos);
++        int sectionIndex = this.getSectionIndex(pos.getY());
++        LevelChunkSection section = chunk.getSections()[sectionIndex];
++
++        if (section == null) return;
++
++        section.setBlockState(pos.getX() & 15, pos.getY() & 15, pos.getZ() & 15, state);
++
++        // Notify clients
++        this.getChunkSource().blockChanged(pos);
++        // Mark chunk dirty for saving
++        chunk.markUnsaved();
++    }
++    // Mica end
++
++    // Mica start - parallel scheduled tick dispatch
++
++    public long micaScheduledTickCumTaint = 0;
++    public long micaScheduledTickCumConf = 0;
++
++    private <T> void micaRunScheduledTicks(java.util.List<net.minecraft.world.ticks.ScheduledTick<T>> ticks, boolean isBlockTick) {
++        final int threadCount = ServerChunkCache.MICA_THREAD_COUNT;
++        final net.minecraft.server.level.mica.WorldSnapshot snapshot = net.minecraft.server.level.mica.WorldSnapshot.capture(this);
++
++        final net.minecraft.server.level.mica.TrackedOverlay[] overlays =
++            new net.minecraft.server.level.mica.TrackedOverlay[threadCount];
++        for (int t = 0; t < threadCount; t++) {
++            overlays[t] = new net.minecraft.server.level.mica.TrackedOverlay(snapshot);
++            overlays[t].deferredEffects = new net.minecraft.server.level.mica.DeferredEffects();
++            overlays[t].setThreadIndex(t);
++        }
++
++        // Map tick positions to OperationIds for original-order re-run
++        final java.util.concurrent.ConcurrentHashMap<Long, net.minecraft.server.level.mica.OperationId> tickPosToOp =
++            new java.util.concurrent.ConcurrentHashMap<>();
++
++        final int batchSize = Math.max(1, (ticks.size() + threadCount - 1) / threadCount);
++        final java.util.concurrent.CountDownLatch latch = new java.util.concurrent.CountDownLatch(threadCount);
++        final java.util.concurrent.atomic.AtomicReference<Throwable> error = new java.util.concurrent.atomic.AtomicReference<>();
++
++        for (int t = 0; t < threadCount; t++) {
++            final int threadIndex = t;
++            final int start = t * batchSize;
++            final int end = Math.min(start + batchSize, ticks.size());
++
++            if (start >= ticks.size()) {
++                latch.countDown();
++                continue;
++            }
++
++            final net.minecraft.server.level.mica.TrackedOverlay overlay = overlays[t];
++
++            ServerChunkCache.MICA_POOL.execute(() -> {
++                try {
++                    ca.spottedleaf.moonrise.common.util.TickThread.micaParallelPhase.set(Boolean.TRUE);
++                    this.micaOverlay.set(overlay);
++                    net.minecraft.world.level.Level.micaDeferredStatic.set(overlay.deferredEffects);
++
++                    alternate.current.wire.WireHandler threadWireHandler = new alternate.current.wire.WireHandler(this);
++                    Level.micaWireHandler.set(threadWireHandler);
++
++                    net.minecraft.world.level.redstone.CollectingNeighborUpdater threadUpdater =
++                        new net.minecraft.world.level.redstone.CollectingNeighborUpdater(
++                            this, this.getServer().getMaxChainedNeighborUpdates());
++                    net.minecraft.world.level.Level.micaNeighborUpdater.set(threadUpdater);
++
++                    try {
++                        for (int i = start; i < end; i++) {
++                            net.minecraft.world.ticks.ScheduledTick<T> tick = ticks.get(i);
++
++                            net.minecraft.server.level.mica.OperationId opId = isBlockTick
++                                ? net.minecraft.server.level.mica.OperationId.blockTick(tick.pos(), threadIndex)
++                                : net.minecraft.server.level.mica.OperationId.fluidTick(tick.pos(), threadIndex);
++                            overlay.setCurrentOperation(opId);
++                            overlay.deferredEffects.setCurrentOperation(opId);
++                            overlay.recordTick(opId, tick.pos());
++                            tickPosToOp.put(tick.pos().asLong(), opId);
++
++                            if (isBlockTick) {
++                                net.minecraft.world.level.block.state.BlockState state = this.getBlockState(tick.pos());
++                                if (state.is((net.minecraft.world.level.block.Block) tick.type())) {
++                                    state.tick(this, tick.pos(), this.random);
++                                }
++                            } else {
++                                net.minecraft.world.level.block.state.BlockState blockState = this.getBlockState(tick.pos());
++                                net.minecraft.world.level.material.FluidState fluidState = blockState.getFluidState();
++                                if (fluidState.is((net.minecraft.world.level.material.Fluid) tick.type())) {
++                                    fluidState.tick(this, tick.pos(), blockState);
++                                }
++                            }
++                        }
++                    } finally {
++                        ca.spottedleaf.moonrise.common.util.TickThread.micaParallelPhase.set(Boolean.FALSE);
++                        this.micaOverlay.remove();
++                        Level.micaWireHandler.remove();
++                        net.minecraft.world.level.Level.micaDeferredStatic.remove();
++                        net.minecraft.world.level.Level.micaNeighborUpdater.remove();
++                    }
++                } catch (Throwable t1) {
++                    error.compareAndSet(null, t1);
++                    ServerChunkCache.MICA_LOGGER.error("[Mica] Error in parallel scheduled tick on thread {}", threadIndex, t1);
++                } finally {
++                    latch.countDown();
++                }
++            });
++        }
++
++        try {
++            latch.await();
++        } catch (InterruptedException e) {
++            Thread.currentThread().interrupt();
++        }
++
++        if (error.get() != null) {
++            ServerChunkCache.MICA_LOGGER.error("[Mica] Scheduled tick had errors");
++            return;
++        }
++
++        // Merge overlays
++        java.util.List<net.minecraft.server.level.mica.TrackedOverlay> activeOverlays =
++            java.util.Arrays.asList(overlays).subList(0, threadCount);
++        net.minecraft.server.level.mica.OverlayMerger.MergeResult mergeResult =
++            net.minecraft.server.level.mica.OverlayMerger.merge(activeOverlays);
++
++        ServerChunkCache.MICA_LOGGER.info("[Mica/Scheduled] collected {} ticks, {} tainted",
++            ticks.size(), mergeResult.taintedOperationCount());
++
++        // Replay deferred scheduled ticks — but only if no re-run happened
++        if (!mergeResult.taintedOperations().isEmpty()) {
++            ServerChunkCache.MICA_LOGGER.info("[Mica/Scheduled] TAINTED — re-running {} ticks serially", ticks.size());
++            // Discard ALL parallel results — run everything serially against the live world
++            // This is identical to vanilla execution
++            for (var tick : ticks) {
++                if (isBlockTick) {
++                    net.minecraft.world.level.block.state.BlockState state = this.getBlockState(tick.pos());
++                    if (state.is((net.minecraft.world.level.block.Block) tick.type())) {
++                        state.tick(this, tick.pos(), this.random);
++                    }
++                } else {
++                    net.minecraft.world.level.block.state.BlockState blockState = this.getBlockState(tick.pos());
++                    net.minecraft.world.level.material.FluidState fluidState = blockState.getFluidState();
++                    if (fluidState.is((net.minecraft.world.level.material.Fluid) tick.type())) {
++                        fluidState.tick(this, tick.pos(), blockState);
++                    }
++                }
++            }
++        }
++        else {
++            int deferredTickCount = 0;
++            for (int t = 0; t < threadCount; t++) {
++                if (overlays[t].deferredEffects != null) {
++                    deferredTickCount += overlays[t].deferredEffects.getScheduledTicks().size();
++                }
++            }
++            ServerChunkCache.MICA_LOGGER.info("[Mica/Scheduled] CLEAN — {} writes, {} deferred ticks",
++                mergeResult.cleanWrites().size(), deferredTickCount);
++            // Apply ALL writes to live world (single pass)
++            for (var entry : mergeResult.cleanWrites().long2ObjectEntrySet()) {
++                net.minecraft.core.BlockPos pos = net.minecraft.core.BlockPos.of(entry.getLongKey());
++                this.micaRawSetBlock(pos, entry.getValue());
++            }
++
++            // Replay deferred scheduled ticks
++            for (int t = 0; t < threadCount; t++) {
++                if (overlays[t].deferredEffects != null) {
++                    for (var st : overlays[t].deferredEffects.getScheduledTicks()) {
++                        if (st.isBlock()) {
++                            this.getBlockTicks().schedule((net.minecraft.world.ticks.ScheduledTick) st.tick());
++                        } else {
++                            this.getFluidTicks().schedule((net.minecraft.world.ticks.ScheduledTick) st.tick());
++                        }
++                    }
++                }
++            }
++
++            // Apply deferred effects
++            for (int t = 0; t < threadCount; t++) {
++                if (overlays[t].deferredEffects != null && !overlays[t].deferredEffects.isEmpty()) {
++                    overlays[t].deferredEffects.apply(this);
++                }
++            }
++
++            // Collect and execute ticks due for this game tick serially
++            // Mica - drain same-tick cascades until stable
++            if (isBlockTick) {
++                long currentTick = this.getGameTime();
++                while (true) {
++                    java.util.List<net.minecraft.world.ticks.ScheduledTick<net.minecraft.world.level.block.Block>> cascadeTicks =
++                        ((net.minecraft.world.ticks.LevelTicks<net.minecraft.world.level.block.Block>) this.getBlockTicks())
++                            .collectForParallelDispatch(currentTick, 65536);
++                    if (cascadeTicks.isEmpty()) {
++                        ((net.minecraft.world.ticks.LevelTicks<net.minecraft.world.level.block.Block>) this.getBlockTicks())
++                            .finishParallelDispatch();
++                        break;
++                    }
++                    for (var tick : cascadeTicks) {
++                        net.minecraft.world.level.block.state.BlockState state = this.getBlockState(tick.pos());
++                        if (state.is((net.minecraft.world.level.block.Block) tick.type())) {
++                            state.tick(this, tick.pos(), this.random);
++                        }
++                    }
++                    ((net.minecraft.world.ticks.LevelTicks<net.minecraft.world.level.block.Block>) this.getBlockTicks())
++                        .finishParallelDispatch();
++                }
++            } else {
++                long currentTick = this.getGameTime();
++                while (true) {
++                    java.util.List<net.minecraft.world.ticks.ScheduledTick<net.minecraft.world.level.material.Fluid>> cascadeTicks =
++                        ((net.minecraft.world.ticks.LevelTicks<net.minecraft.world.level.material.Fluid>) this.getFluidTicks())
++                            .collectForParallelDispatch(currentTick, 65536);
++                    if (cascadeTicks.isEmpty()) {
++                        ((net.minecraft.world.ticks.LevelTicks<net.minecraft.world.level.material.Fluid>) this.getFluidTicks())
++                            .finishParallelDispatch();
++                        break;
++                    }
++                    for (var tick : cascadeTicks) {
++                        net.minecraft.world.level.block.state.BlockState blockState = this.getBlockState(tick.pos());
++                        net.minecraft.world.level.material.FluidState fluidState = blockState.getFluidState();
++                        if (fluidState.is((net.minecraft.world.level.material.Fluid) tick.type())) {
++                            fluidState.tick(this, tick.pos(), blockState);
++                        }
++                    }
++                    ((net.minecraft.world.ticks.LevelTicks<net.minecraft.world.level.material.Fluid>) this.getFluidTicks())
++                        .finishParallelDispatch();
++                }
++            }
++
++        }
++
++        // Log stats
++        micaScheduledTickCumTaint += mergeResult.taintedOperationCount();
++        micaScheduledTickCumConf += mergeResult.conflictCount();
++
++        this.micaScheduledTickCount++;
++        if (this.micaScheduledTickCount % 200 == 0) {
++            int totalReads = 0, totalWrites = 0;
++            for (int t = 0; t < threadCount; t++) {
++                totalReads += overlays[t].getReadCount();
++                totalWrites += overlays[t].getWriteCount();
++            }
++            ServerChunkCache.MICA_LOGGER.info("[Mica/Scheduled] {} | {} threads | {} ticks | {} reads, {} writes | {} conflicts, {} tainted",
++                isBlockTick ? "blocks" : "fluids",
++                threadCount, ticks.size(), totalReads, totalWrites,
++                micaScheduledTickCumConf, micaScheduledTickCumTaint);
++            micaScheduledTickCumConf = 0;
++            micaScheduledTickCumTaint = 0;
++        }
++    }
++
++    public long micaScheduledTickCount = 0;
+     public long micaEntityTickCount = 0;
++    // Mica end
+ 
+     public void tick(BooleanSupplier hasTimeLeft) {
+         ProfilerFiller profilerFiller = Profiler.get();
+@@ -800,11 +1053,27 @@ public class ServerLevel extends Level implements ServerEntityGetter, WorldGenLe
+         profilerFiller.push("tickPending");
+         if (!this.isDebug() && runsNormally) {
+             long l = this.getGameTime();
++
++            // Mica start - parallel scheduled ticks
+             profilerFiller.push("blockTicks");
+-            this.blockTicks.tick(l, paperConfig().environment.maxBlockTicks, this::tickBlock); // Paper - configurable max block ticks
++            java.util.List<net.minecraft.world.ticks.ScheduledTick<net.minecraft.world.level.block.Block>> blockTickList =
++                this.blockTicks.collectForParallelDispatch(l, paperConfig().environment.maxBlockTicks);
++
++            if (!blockTickList.isEmpty()) {
++                this.micaRunScheduledTicks(blockTickList, true);
++            }
++            this.blockTicks.finishParallelDispatch();
++
+             profilerFiller.popPush("fluidTicks");
+-            this.fluidTicks.tick(l, paperConfig().environment.maxFluidTicks, this::tickFluid); // Paper - configurable max fluid ticks
++            java.util.List<net.minecraft.world.ticks.ScheduledTick<net.minecraft.world.level.material.Fluid>> fluidTickList =
++                this.fluidTicks.collectForParallelDispatch(l, paperConfig().environment.maxFluidTicks);
++
++            if (!fluidTickList.isEmpty()) {
++                this.micaRunScheduledTicks(fluidTickList, false);
++            }
++            this.fluidTicks.finishParallelDispatch();
+             profilerFiller.pop();
++            // Mica end
+         }
+ 
+         profilerFiller.popPush("raid");
+@@ -895,6 +1164,10 @@ public class ServerLevel extends Level implements ServerEntityGetter, WorldGenLe
+                             ca.spottedleaf.moonrise.common.util.TickThread.micaParallelPhase.set(Boolean.TRUE);
+                             this.micaOverlay.set(overlay);
+                             net.minecraft.world.level.Level.micaDeferredStatic.set(overlay.deferredEffects);
++
++                            alternate.current.wire.WireHandler threadWireHandler = new alternate.current.wire.WireHandler(this);
++                            Level.micaWireHandler.set(threadWireHandler);
++
+                             try {
+                                 for (int curEntitiy = start; curEntitiy < end; curEntitiy++) {
+                                     Entity entity = entitiesToTick.get(curEntitiy);
+@@ -904,6 +1177,7 @@ public class ServerLevel extends Level implements ServerEntityGetter, WorldGenLe
+                                         net.minecraft.server.level.mica.OperationId.entityTick(
+                                             entity.getId(), threadIndex);
+                                     overlay.setCurrentOperation(opId);
++                                    overlay.deferredEffects.setCurrentOperation(opId);
+ 
+                                     // Vehicle checks
+                                     Entity vehicle = entity.getVehicle();
+@@ -928,6 +1202,7 @@ public class ServerLevel extends Level implements ServerEntityGetter, WorldGenLe
+                             } finally {
+                                 ca.spottedleaf.moonrise.common.util.TickThread.micaParallelPhase.set(Boolean.FALSE);
+                                 this.micaOverlay.remove();
++                                Level.micaWireHandler.remove();
+                                 net.minecraft.world.level.Level.micaDeferredStatic.remove();
+                             }
+                         } catch (Throwable t1) {
+@@ -955,8 +1230,7 @@ public class ServerLevel extends Level implements ServerEntityGetter, WorldGenLe
+                 for (int t = 0; t < threadCount; t++) {
+                     for (var entry : entityOverlays[t].getBlockWrites().long2ObjectEntrySet()) {
+                         net.minecraft.core.BlockPos pos = net.minecraft.core.BlockPos.of(entry.getLongKey());
+-                        net.minecraft.world.level.block.state.BlockState state = entry.getValue();
+-                        this.setBlock(pos, state, net.minecraft.world.level.block.Block.UPDATE_ALL);
++                        this.micaRawSetBlock(pos, entry.getValue());
+                     }
+                 }
+ 
+@@ -2926,10 +3200,19 @@ public class ServerLevel extends Level implements ServerEntityGetter, WorldGenLe
+         return this.debugSynchronizers;
+     }
+ 
++    // Mica - per-thread wire handler for parallel execution
++    public static final ThreadLocal<alternate.current.wire.WireHandler> micaWireHandler = new ThreadLocal<>();
++
+     // Paper start - optimize redstone (Alternate Current)
+     @Override
+     public alternate.current.wire.WireHandler getWireHandler() {
+-        return wireHandler;
++        // Mica start - per-thread wire handler during parallel execution
++        alternate.current.wire.WireHandler micaHandler = Level.micaWireHandler.get();
++        if (micaHandler != null) {
++            return micaHandler;
++        }
++        // Mica end
++        return this.wireHandler;
+     }
+     // Paper end - optimize redstone (Alternate Current)
+ 
+diff --git a/net/minecraft/server/level/mica/DeferredEffects.java b/net/minecraft/server/level/mica/DeferredEffects.java
+index 2cb6b22bf14449a8437de78bce84eb4a3368a6c6..eb0939d2774c7d5f1110bcbeee58a883d1664401 100644
+--- a/net/minecraft/server/level/mica/DeferredEffects.java
++++ b/net/minecraft/server/level/mica/DeferredEffects.java
+@@ -8,6 +8,8 @@ import org.bukkit.event.Event;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ 
++import org.jspecify.annotations.Nullable;
++
+ import java.util.ArrayList;
+ import java.util.List;
+ 
+@@ -54,6 +56,29 @@ public class DeferredEffects {
+         this.skippedOtherCount++;
+     }
+ 
++    // Change the record to include the source operation
++    public record DeferredScheduledTick(net.minecraft.world.ticks.ScheduledTick<?> tick, boolean isBlock,
++                                        net.minecraft.server.level.mica.OperationId sourceOp) {}
++
++    private final List<DeferredScheduledTick> scheduledTicks = new ArrayList<>();
++
++    // Add a field to track current operation
++    private @Nullable OperationId currentOperation;
++
++    public void setCurrentOperation(@Nullable OperationId op) {
++        this.currentOperation = op;
++    }
++
++    // Update addScheduledTick to tag with current operation
++    public <T> void addScheduledTick(net.minecraft.world.ticks.ScheduledTick<T> tick, boolean isBlock) {
++        this.scheduledTicks.add(new DeferredScheduledTick(tick, isBlock, this.currentOperation));
++    }
++
++    // Add getter
++    public java.util.List<DeferredScheduledTick> getScheduledTicks() {
++        return this.scheduledTicks;
++    }
++
+     /**
+      * Apply all buffered effects to the world on the main thread.
+      */
+@@ -82,13 +107,15 @@ public class DeferredEffects {
+         this.skippedEventCount = 0;
+         this.skippedEntitySpawnCount = 0;
+         this.skippedOtherCount = 0;
++        this.currentOperation = null;
+     }
+ 
+     public boolean isEmpty() {
+         return this.entitySpawns.isEmpty()
+             && this.deferredEvents.isEmpty()
+             && this.effects.isEmpty()
+-            && this.deferredTasks.isEmpty();
++            && this.deferredTasks.isEmpty()
++            && this.scheduledTicks.isEmpty();
+     }
+ 
+     public int getSkippedEventCount() { return this.skippedEventCount; }
+diff --git a/net/minecraft/server/level/mica/OverlayMerger.java b/net/minecraft/server/level/mica/OverlayMerger.java
+index 8955032d864a9b5f1686481c1cc4fe337dba9f44..9e603fe23e027770f611910a5414564fcfad7b04 100644
+--- a/net/minecraft/server/level/mica/OverlayMerger.java
++++ b/net/minecraft/server/level/mica/OverlayMerger.java
+@@ -103,10 +103,8 @@ public class OverlayMerger {
+                     if (i == j) continue;
+ 
+                     if (overlays.get(j).getReadPositions().contains(pos)) {
+-                        // Taint the writer
+                         taintedOps.add(writer);
+ 
+-                        // Find exactly which operations on the reading overlay read this position
+                         for (TrackedOverlay.ReadRecord record : overlays.get(j).getOperationReads()) {
+                             if (record.pos() == pos) {
+                                 taintedOps.add(record.opId());
+@@ -117,6 +115,50 @@ public class OverlayMerger {
+             }
+         }
+ 
++        // === Step 3b: Check for cascade-read conflicts ===
++        // If Thread A's cascade touched a position that Thread B read,
++        // those operations are in conflict even though no write occurred
++        // at that position. The cascade means the position's significance
++        // was evaluated as part of Thread A's operation — if Thread A had
++        // run first, the outcome at that position might have been different.
++        for (int i = 0; i < overlays.size(); i++) {
++            TrackedOverlay toucherOverlay = overlays.get(i);
++            it.unimi.dsi.fastutil.longs.LongOpenHashSet touched = toucherOverlay.getTouchedPositions();
++
++            if (touched.isEmpty()) continue;
++
++            for (int j = 0; j < overlays.size(); j++) {
++                if (i == j) continue;
++
++                TrackedOverlay readerOverlay = overlays.get(j);
++
++                // Find positions that overlay i's cascade touched AND overlay j read
++                for (long touchedPos : touched) {
++                    // Skip if this was already a write — handled in Step 3
++                    if (toucherOverlay.hasWrite(touchedPos)) continue;
++
++                    if (readerOverlay.getReadPositions().contains(touchedPos)) {
++                        // Find the operation that caused the cascade on overlay i
++                        // The touched position was read during a cascade, so find
++                        // which operation's reads include this position
++                        for (TrackedOverlay.ReadRecord record : toucherOverlay.getOperationReads()) {
++                            if (record.pos() == touchedPos) {
++                                taintedOps.add(record.opId());
++                                break;
++                            }
++                        }
++
++                        // Find the operations on overlay j that read this position
++                        for (TrackedOverlay.ReadRecord record : readerOverlay.getOperationReads()) {
++                            if (record.pos() == touchedPos) {
++                                taintedOps.add(record.opId());
++                            }
++                        }
++                    }
++                }
++            }
++        }
++
+         // === Early exit: nothing tainted ===
+         if (taintedOps.isEmpty()) {
+             return new MergeResult(
+@@ -129,6 +171,7 @@ public class OverlayMerger {
+         }
+ 
+         // === Step 4: Transitive closure via targeted BFS ===
++        // Walk from tainted operations to find all transitively affected operations
+         java.util.ArrayDeque<OperationId> worklist = new java.util.ArrayDeque<>(taintedOps);
+ 
+         while (!worklist.isEmpty()) {
+@@ -152,6 +195,35 @@ public class OverlayMerger {
+                     }
+                 }
+             }
++
++            // Also walk through cascade-touched positions of the tainted operation
++            for (TrackedOverlay overlay : overlays) {
++                for (long touchedPos : overlay.getTouchedPositions()) {
++                    if (overlay.hasWrite(touchedPos)) continue;
++
++                    // Check if this touched position belongs to the tainted operation
++                    boolean belongsToTainted = false;
++                    for (TrackedOverlay.ReadRecord record : overlay.getOperationReads()) {
++                        if (record.pos() == touchedPos && record.opId().equals(tainted)) {
++                            belongsToTainted = true;
++                            break;
++                        }
++                    }
++
++                    if (!belongsToTainted) continue;
++
++                    // Find operations on other overlays that read this position
++                    for (TrackedOverlay readerOverlay : overlays) {
++                        if (readerOverlay == overlay) continue;
++                        for (TrackedOverlay.ReadRecord record : readerOverlay.getOperationReads()) {
++                            if (record.pos() == touchedPos && !taintedOps.contains(record.opId())) {
++                                taintedOps.add(record.opId());
++                                worklist.add(record.opId());
++                            }
++                        }
++                    }
++                }
++            }
+         }
+ 
+         // === Step 5: Remove tainted operations' writes from clean writes ===
+diff --git a/net/minecraft/server/level/mica/TrackedOverlay.java b/net/minecraft/server/level/mica/TrackedOverlay.java
+index 4cc6afede00a2b37f59f03c7ab28c7d073622a1d..e0b72e5e8ee38a195d62771a65d7a5d802f334bb 100644
+--- a/net/minecraft/server/level/mica/TrackedOverlay.java
++++ b/net/minecraft/server/level/mica/TrackedOverlay.java
+@@ -67,6 +67,20 @@ public class TrackedOverlay implements BlockGetter {
+         this.snapshot = snapshot;
+     }
+ 
++    private final it.unimi.dsi.fastutil.longs.LongOpenHashSet touchedPositions = new it.unimi.dsi.fastutil.longs.LongOpenHashSet();
++    private boolean inCascade = false;
++
++    public void beginCascade() {
++        this.inCascade = true;
++    }
++
++    public void endCascade() {
++        this.inCascade = false;
++    }
++
++    public it.unimi.dsi.fastutil.longs.LongOpenHashSet getTouchedPositions() {
++        return this.touchedPositions;
++    }
+ 
+     public void setThreadIndex(int threadIndex) {
+         this.threadIndex = threadIndex;
+@@ -76,6 +90,10 @@ public class TrackedOverlay implements BlockGetter {
+         return this.threadIndex;
+     }
+ 
++    public @Nullable OperationId getCurrentOperation() {
++        return this.currentOperation;
++    }
++
+     public void recordTick(OperationId opId, BlockPos pos) {
+         this.tickRecords.add(new TickRecord(opId, pos.immutable()));
+     }
+@@ -109,6 +127,11 @@ public class TrackedOverlay implements BlockGetter {
+             this.operationReads.add(new ReadRecord(this.currentOperation, packed));
+         }
+ 
++        // Mica - track cascade-influenced positions
++        if (this.inCascade) {
++            this.touchedPositions.add(packed);
++        }
++
+         BlockState overlayState = this.blockWrites.get(packed);
+         if (overlayState != null) {
+             this.overlayHitCount++;
+@@ -206,6 +229,7 @@ public class TrackedOverlay implements BlockGetter {
+         this.readProvenance.clear();
+         this.readPositions.clear();
+         this.operationReads.clear();
++        this.touchedPositions.clear();
+         this.currentOperation = null;
+         this.threadIndex = 0;
+         this.tickRecords.clear();
+diff --git a/net/minecraft/world/level/Level.java b/net/minecraft/world/level/Level.java
+index 1b9ad765340c4615667f54c4d51303e59402562a..35f966fd7d1f8b61e325cc6a6dad12bcee0e1712 100644
+--- a/net/minecraft/world/level/Level.java
++++ b/net/minecraft/world/level/Level.java
+@@ -1051,52 +1051,6 @@ public abstract class Level implements LevelAccessor, AutoCloseable, ca.spottedl
+ 
+     @Override
+     public boolean setBlock(BlockPos pos, BlockState state, @Block.UpdateFlags int flags, int recursionLeft) {
+-        // Mica start - redirect writes to overlay during parallel compute
+-        net.minecraft.server.level.mica.TrackedOverlay overlay = this.micaOverlay.get();
+-        if (overlay != null) {
+-            if (!this.isInValidBounds(pos)) return false;
+-
+-            BlockState oldState = overlay.getBlockState(pos);
+-            if (oldState == state) return false;
+-
+-            overlay.setBlockState(pos, state);
+-
+-            // Fire neighbor updates through thread-local updater
+-            // These reads/writes go through the overlay automatically
+-            if ((flags & Block.UPDATE_NEIGHBORS) != 0) {
+-                CollectingNeighborUpdater updater = Level.micaNeighborUpdater.get();
+-                if (updater != null) {
+-                    updater.updateNeighborsAtExceptFromFacing(pos, state.getBlock(), null,
+-                        net.minecraft.world.level.redstone.ExperimentalRedstoneUtils.initialOrientation(this, null, null));
+-                    if (state.hasAnalogOutputSignal()) {
+-                        this.updateNeighbourForOutputSignal(pos, state.getBlock());
+-                    }
+-                }
+-            }
+-
+-            // Shape updates for adjacent blocks
+-            if ((flags & Block.UPDATE_KNOWN_SHAPE) == 0 && recursionLeft > 0) {
+-                int i = flags & ~(Block.UPDATE_SUPPRESS_DROPS | Block.UPDATE_NEIGHBORS);
+-                oldState.updateIndirectNeighbourShapes(this, pos, i, recursionLeft - 1);
+-                state.updateNeighbourShapes(this, pos, i, recursionLeft - 1);
+-                state.updateIndirectNeighbourShapes(this, pos, i, recursionLeft - 1);
+-            }
+-
+-            // Defer POI update to main thread
+-            net.minecraft.server.level.mica.DeferredEffects deferred = Level.micaDeferredStatic.get();
+-            if (deferred != null) {
+-                final BlockState deferredOld = oldState;
+-                final BlockState deferredNew = state;
+-                final BlockPos deferredPos = pos.immutable();
+-                deferred.addDeferredTask(() -> {
+-                    this.updatePOIOnBlockStateChange(deferredPos, deferredOld, deferredNew);
+-                });
+-            }
+-
+-            return true;
+-        }
+-        // Mica end
+-
+         // CraftBukkit start - tree generation
+         if (this.captureTreeGeneration) {
+             // Paper start - Protect Bedrock and End Portal/Frames from being destroyed
+@@ -1200,11 +1154,17 @@ public abstract class Level implements LevelAccessor, AutoCloseable, ca.spottedl
+         BlockState blockState1 = currentState;
+         if (blockState1 == state) {
+             if (blockState != blockState1) {
+-                this.setBlocksDirty(pos, blockState, blockState1);
++                // Mica start - suppress during parallel
++                if (this.micaOverlay.get() == null) {
++                    this.setBlocksDirty(pos, blockState, blockState1);
++                }
++                // Mica end
+             }
+ 
+             if ((flags & Block.UPDATE_CLIENTS) != 0 && (!this.isClientSide() || (flags & Block.UPDATE_INVISIBLE) == 0) && (this.isClientSide() || chunkAt == null || (chunkAt.getFullStatus() != null && chunkAt.getFullStatus().isOrAfter(FullChunkStatus.FULL)))) { // allow chunk to be null here as chunk.isReady() is false when we send our notification during block placement // Paper - rewrite chunk system - change from ticking to full
+-                this.sendBlockUpdated(pos, blockState, state, flags);
++                if (this.micaOverlay.get() == null) {
++                    this.sendBlockUpdated(pos, blockState, state, flags);
++                }
+             }
+ 
+             if ((flags & Block.UPDATE_NEIGHBORS) != 0) {
+@@ -1221,8 +1181,10 @@ public abstract class Level implements LevelAccessor, AutoCloseable, ca.spottedl
+                 blockState.updateIndirectNeighbourShapes(this, pos, i, recursionLeft - 1); // Don't call an event for the old block to limit event spam
+                 boolean cancelledUpdates = false; // Paper - Fix block place logic
+                 if (((ServerLevel)this).hasPhysicsEvent) { // Paper - BlockPhysicsEvent
+-                    org.bukkit.event.block.BlockPhysicsEvent event = new org.bukkit.event.block.BlockPhysicsEvent(org.bukkit.craftbukkit.block.CraftBlock.at(this, pos), CraftBlockData.fromData(state));
+-                    cancelledUpdates = !event.callEvent(); // Paper - Fix block place logic
++                    if (((ServerLevel)this).hasPhysicsEvent) { // Mica - suppress BlockPhysicsEvent during parallel execution
++                        org.bukkit.event.block.BlockPhysicsEvent event = new org.bukkit.event.block.BlockPhysicsEvent(org.bukkit.craftbukkit.block.CraftBlock.at(this, pos), CraftBlockData.fromData(state));
++                        cancelledUpdates = !event.callEvent(); // Paper - Fix block place logic
++                    }
+                 }
+                 // CraftBukkit end
+                 if (!cancelledUpdates) { // Paper - Fix block place logic
+@@ -1231,7 +1193,11 @@ public abstract class Level implements LevelAccessor, AutoCloseable, ca.spottedl
+                 } // Paper - Fix block place logic
+             }
+ 
+-            this.updatePOIOnBlockStateChange(pos, blockState, blockState1);
++            // Mica start - suppress POI during parallel
++            if (this.micaOverlay.get() == null) {
++                this.updatePOIOnBlockStateChange(pos, blockState, blockState1);
++            }
++            // Mica end
+         }
+     }
+     // CraftBukkit end
+@@ -2128,6 +2094,8 @@ public abstract class Level implements LevelAccessor, AutoCloseable, ca.spottedl
+         return this.palettedContainerFactory;
+     }
+ 
++    public static final ThreadLocal<alternate.current.wire.WireHandler> micaWireHandler = new ThreadLocal<>();
++
+     // Paper start - optimize redstone (Alternate Current)
+     public alternate.current.wire.WireHandler getWireHandler() {
+         // This method is overridden in ServerLevel.
+diff --git a/net/minecraft/world/level/chunk/LevelChunk.java b/net/minecraft/world/level/chunk/LevelChunk.java
+index 3acc1374a7ef968d88e9f566ce7b812fb8d580af..11ee1227edbda634f76cfbbb93144ecd2c3de74f 100644
+--- a/net/minecraft/world/level/chunk/LevelChunk.java
++++ b/net/minecraft/world/level/chunk/LevelChunk.java
+@@ -374,42 +374,80 @@ public class LevelChunk extends ChunkAccess implements DebugValueSource, ca.spot
+             int i = pos.getX() & 15;
+             int i1 = y & 15;
+             int i2 = pos.getZ() & 15;
+-            BlockState blockState = section.setBlockState(i, i1, i2, state);
++
++            // Mica start - redirect palette write to overlay
++            net.minecraft.server.level.mica.TrackedOverlay overlay = this.level.micaOverlay.get();
++            BlockState blockState;
++            if (overlay != null) {
++                blockState = overlay.getBlockState(pos);
++                if (blockState == state) return null;
++                overlay.setBlockState(pos, state);
++            } else {
++                blockState = section.setBlockState(i, i1, i2, state);
++                if (blockState == state) return null;
++            }
++            // Mica end
++
+             if (blockState == state) {
+                 return null;
+             } else {
++
+                 Block block = state.getBlock();
+-                this.heightmaps.get(Heightmap.Types.MOTION_BLOCKING).update(i, y, i2, state);
+-                this.heightmaps.get(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES).update(i, y, i2, state);
+-                this.heightmaps.get(Heightmap.Types.OCEAN_FLOOR).update(i, y, i2, state);
+-                this.heightmaps.get(Heightmap.Types.WORLD_SURFACE).update(i, y, i2, state);
+-                boolean hasOnlyAir1 = section.hasOnlyAir();
+-                if (hasOnlyAir != hasOnlyAir1) {
+-                    this.level.getChunkSource().getLightEngine().updateSectionStatus(pos, hasOnlyAir1);
+-                    this.level.getChunkSource().onSectionEmptinessChanged(this.chunkPos.x, SectionPos.blockToSectionCoord(y), this.chunkPos.z, hasOnlyAir1);
+-                }
+ 
+-                if (LightEngine.hasDifferentLightProperties(blockState, state)) {
+-                    ProfilerFiller profilerFiller = Profiler.get();
+-                    profilerFiller.push("updateSkyLightSources");
+-                    // Paper - rewrite chunk system
+-                    profilerFiller.popPush("queueCheckLight");
+-                    this.level.getChunkSource().getLightEngine().checkBlock(pos);
+-                    profilerFiller.pop();
++                // Mica start - skip heightmaps and lighting during parallel execution.
++                if(overlay == null) {
++                    this.heightmaps.get(Heightmap.Types.MOTION_BLOCKING).update(i, y, i2, state);
++                    this.heightmaps.get(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES).update(i, y, i2, state);
++                    this.heightmaps.get(Heightmap.Types.OCEAN_FLOOR).update(i, y, i2, state);
++                    this.heightmaps.get(Heightmap.Types.WORLD_SURFACE).update(i, y, i2, state);
++                    boolean hasOnlyAir1 = section.hasOnlyAir();
++                    if (hasOnlyAir != hasOnlyAir1) {
++                        this.level.getChunkSource().getLightEngine().updateSectionStatus(pos, hasOnlyAir1);
++                        this.level.getChunkSource().onSectionEmptinessChanged(this.chunkPos.x, SectionPos.blockToSectionCoord(y), this.chunkPos.z, hasOnlyAir1);
++                    }
++
++                    if (LightEngine.hasDifferentLightProperties(blockState, state)) {
++                        ProfilerFiller profilerFiller = Profiler.get();
++                        profilerFiller.push("updateSkyLightSources");
++                        // Paper - rewrite chunk system
++                        profilerFiller.popPush("queueCheckLight");
++                        this.level.getChunkSource().getLightEngine().checkBlock(pos);
++                        profilerFiller.pop();
++                    }
+                 }
++                // Mica end
+ 
+                 boolean flag = !blockState.is(block);
+                 boolean flag1 = (flags & Block.UPDATE_MOVE_BY_PISTON) != 0;
+                 boolean flag2 = (flags & Block.UPDATE_SKIP_BLOCK_ENTITY_SIDEEFFECTS) == 0;
+                 if (flag && blockState.hasBlockEntity() && !state.shouldChangedStateKeepBlockEntity(blockState)) {
+-                    if (!this.level.isClientSide() && flag2) {
+-                        BlockEntity blockEntity = this.level.getBlockEntity(pos);
+-                        if (blockEntity != null) {
+-                            blockEntity.preRemoveSideEffects(pos, blockState);
++
++                    // Mica start - defer block entity removal during parallel execution)
++                    Runnable removeEntity = () -> {
++                        if (!this.level.isClientSide() && flag2) {
++                            BlockEntity blockEntity = this.level.getBlockEntity(pos);
++                            if (blockEntity != null) {
++                                blockEntity.preRemoveSideEffects(pos, blockState);
++                            }
++                        }
++                        this.removeBlockEntity(pos);
++                    };
++
++                    if(overlay != null)
++                    {
++                        net.minecraft.server.level.mica.DeferredEffects deferred = net.minecraft.world.level.Level.micaDeferredStatic.get();
++                        if(deferred != null)
++                        {
++                            deferred.addDeferredTask(removeEntity);
+                         }
+                     }
++                    else
++                    {
++                        // We're in serial execution, just execute the removal event.
++                        removeEntity.run();
++                    }
++                    // Mica end
+ 
+-                    this.removeBlockEntity(pos);
+                 }
+ 
+                 if ((flag || block instanceof BaseRailBlock)
+@@ -418,40 +456,47 @@ public class LevelChunk extends ChunkAccess implements DebugValueSource, ca.spot
+                     blockState.affectNeighborsAfterRemoval(serverLevel, pos, flag1);
+                 }
+ 
+-                if (!section.getBlockState(i, i1, i2).is(block)) {
++                // Mica start - Only run block verification during serial execution.
++                if ( overlay != null && !section.getBlockState(i, i1, i2).is(block)) {
+                     return null;
+-                } else {
+-                    if (!this.level.isClientSide() && (flags & Block.UPDATE_SKIP_ON_PLACE) == 0 && (!this.level.captureBlockStates || block instanceof net.minecraft.world.level.block.BaseEntityBlock)) { // CraftBukkit - Don't place while processing the BlockPlaceEvent, unless it's a BlockContainer. Prevents blocks such as TNT from activating when cancelled.
+-                        state.onPlace(this.level, pos, blockState, flag1);
+-                    }
++                }
++                // Mica end
+ 
+-                    if (state.hasBlockEntity()) {
+-                        BlockEntity blockEntity = this.getBlockEntity(pos, LevelChunk.EntityCreationType.CHECK);
+-                        if (blockEntity != null && !blockEntity.isValidBlockState(state)) {
+-                            LOGGER.warn(
+-                                "Found mismatched block entity @ {}: type = {}, state = {}",
+-                                pos,
+-                                blockEntity.getType().builtInRegistryHolder().key().identifier(),
+-                                state
+-                            );
+-                            this.removeBlockEntity(pos);
+-                            blockEntity = null;
+-                        }
++                if (!this.level.isClientSide() && (flags & Block.UPDATE_SKIP_ON_PLACE) == 0 && (!this.level.captureBlockStates || block instanceof net.minecraft.world.level.block.BaseEntityBlock)) { // CraftBukkit - Don't place while processing the BlockPlaceEvent, unless it's a BlockContainer. Prevents blocks such as TNT from activating when cancelled.
++                    state.onPlace(this.level, pos, blockState, flag1);
++                }
+ 
+-                        if (blockEntity == null) {
+-                            blockEntity = ((EntityBlock)block).newBlockEntity(pos, state);
+-                            if (blockEntity != null) {
+-                                this.addAndRegisterBlockEntity(blockEntity);
+-                            }
+-                        } else {
+-                            blockEntity.setBlockState(state);
+-                            this.updateBlockEntityTicker(blockEntity);
++                if (state.hasBlockEntity()) {
++                    BlockEntity blockEntity = this.getBlockEntity(pos, LevelChunk.EntityCreationType.CHECK);
++                    if (blockEntity != null && !blockEntity.isValidBlockState(state)) {
++                        LOGGER.warn(
++                            "Found mismatched block entity @ {}: type = {}, state = {}",
++                            pos,
++                            blockEntity.getType().builtInRegistryHolder().key().identifier(),
++                            state
++                        );
++                        this.removeBlockEntity(pos);
++                        blockEntity = null;
++                    }
++
++                    if (blockEntity == null) {
++                        blockEntity = ((EntityBlock)block).newBlockEntity(pos, state);
++                        if (blockEntity != null) {
++                            this.addAndRegisterBlockEntity(blockEntity);
+                         }
++                    } else {
++                        blockEntity.setBlockState(state);
++                        this.updateBlockEntityTicker(blockEntity);
+                     }
++                }
+ 
++                if(overlay == null)
++                {
+                     this.markUnsaved();
+-                    return blockState;
+                 }
++
++
++                return blockState;
+             }
+         }
+     }
+diff --git a/net/minecraft/world/level/redstone/CollectingNeighborUpdater.java b/net/minecraft/world/level/redstone/CollectingNeighborUpdater.java
+index 0a60ff97dc77108997568c75c94327cb6858018f..2a2037ebab585ab4386672d1dcabb06c302a3bad 100644
+--- a/net/minecraft/world/level/redstone/CollectingNeighborUpdater.java
++++ b/net/minecraft/world/level/redstone/CollectingNeighborUpdater.java
+@@ -63,7 +63,7 @@ public class CollectingNeighborUpdater implements NeighborUpdater {
+                 this.stack.push(updates);
+             }
+         } else if (this.count - 1 == this.maxChainedNeighborUpdates) {
+-            LOGGER.error("Too many chained neighbor updates. Skipping the rest. First skipped position: {}", pos.toShortString());
++            LOGGER.error("Too many chained neighbor updates ({}). Skipping the rest. First skipped position: {}", this.count, pos.toShortString());
+         }
+ 
+         if (!flag) {
+diff --git a/net/minecraft/world/ticks/LevelTicks.java b/net/minecraft/world/ticks/LevelTicks.java
+index b932f32d08ad663cd05910140c861045a9b1f922..b19edd136ac52ceb32be386314bbf64459ea1bee 100644
+--- a/net/minecraft/world/ticks/LevelTicks.java
++++ b/net/minecraft/world/ticks/LevelTicks.java
+@@ -70,14 +70,53 @@ public class LevelTicks<T> implements LevelTickAccess<T> {
+ 
+     @Override
+     public void schedule(ScheduledTick<T> tick) {
++        // Mica start - defer during parallel execution
++        net.minecraft.server.level.mica.DeferredEffects deferred = net.minecraft.world.level.Level.micaDeferredStatic.get();
++        if (deferred != null) {
++            boolean isBlock = tick.type() instanceof net.minecraft.world.level.block.Block;
++            deferred.addScheduledTick(tick, isBlock);
++            return;
++        }
++        // Mica end
++
++
+         long packedChunkPos = ChunkPos.asLong(tick.pos());
+         LevelChunkTicks<T> levelChunkTicks = this.allContainers.get(packedChunkPos);
+         if (levelChunkTicks == null) {
+             Util.logAndPauseIfInIde("Trying to schedule tick in not loaded position " + tick.pos());
+         } else {
+-            levelChunkTicks.schedule(tick);
++            // Mica start - synchronize for parallel tick safety
++            synchronized (levelChunkTicks) {
++                levelChunkTicks.schedule(tick);
++            }
++            // Mica end
++        }
++    }
++
++    // Mica start - expose tick collection for parallel dispatch
++    public java.util.List<ScheduledTick<T>> collectForParallelDispatch(long gameTime, int maxAllowedTicks) {
++        ProfilerFiller profilerFiller = Profiler.get();
++        profilerFiller.push("collect");
++        this.collectTicks(gameTime, maxAllowedTicks, profilerFiller);
++        profilerFiller.pop();
++
++        // Drain into a list for external dispatch
++        java.util.List<ScheduledTick<T>> collected = new java.util.ArrayList<>(this.toRunThisTick.size());
++        while (!this.toRunThisTick.isEmpty()) {
++            ScheduledTick<T> tick = this.toRunThisTick.poll();
++            if (!this.toRunThisTickSet.isEmpty()) {
++                this.toRunThisTickSet.remove(tick);
++            }
++            this.alreadyRunThisTick.add(tick);
++            collected.add(tick);
+         }
++        return collected;
++    }
++
++    public void finishParallelDispatch() {
++        this.cleanupAfterTick();
+     }
++    // Mica end
+ 
+     public void tick(long gameTime, int maxAllowedTicks, BiConsumer<BlockPos, T> ticker) {
+         ProfilerFiller profilerFiller = Profiler.get();
