@@ -1,0 +1,535 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grant Oberhauser <oberhausergrant@gmail.com>
+Date: Mon, 9 Mar 2026 22:01:46 -0700
+Subject: [PATCH] Mica: Working redstone
+
+
+diff --git a/net/minecraft/server/level/ServerLevel.java b/net/minecraft/server/level/ServerLevel.java
+index a1135dc02b24a36c230258cf1be30129a75de78f..b71b3a4c7c7004da6f62fd0bea98661f195b53e6 100644
+--- a/net/minecraft/server/level/ServerLevel.java
++++ b/net/minecraft/server/level/ServerLevel.java
+@@ -60,6 +60,8 @@ import net.minecraft.resources.Identifier;
+ import net.minecraft.resources.ResourceKey;
+ import net.minecraft.server.MinecraftServer;
+ import net.minecraft.server.ServerScoreboard;
++import net.minecraft.server.level.mica.OperationId;
++import net.minecraft.server.level.mica.TrackedOverlay;
+ import net.minecraft.server.players.SleepStatus;
+ import net.minecraft.server.waypoints.ServerWaypointManager;
+ import net.minecraft.sounds.SoundEvent;
+@@ -760,11 +762,10 @@ public class ServerLevel extends Level implements ServerEntityGetter, WorldGenLe
+         if (section == null) return;
+ 
+         section.setBlockState(pos.getX() & 15, pos.getY() & 15, pos.getZ() & 15, state);
+-
+-        // Notify clients
+-        this.getChunkSource().blockChanged(pos);
+-        // Mark chunk dirty for saving
+         chunk.markUnsaved();
++
++        // Note, we are explicitly not notifying clients here. That's done later in one intentional batch so we don't
++        // get flickering from conflict resolution.
+     }
+     // Mica end
+ 
+@@ -877,17 +878,45 @@ public class ServerLevel extends Level implements ServerEntityGetter, WorldGenLe
+         net.minecraft.server.level.mica.OverlayMerger.MergeResult mergeResult =
+             net.minecraft.server.level.mica.OverlayMerger.merge(activeOverlays);
+ 
+-        ServerChunkCache.MICA_LOGGER.info("[Mica/Scheduled] collected {} ticks, {} tainted",
+-            ticks.size(), mergeResult.taintedOperationCount());
++        // ServerChunkCache.MICA_LOGGER.info("[Mica/Scheduled] collected {} ticks, {} tainted",
++        //     ticks.size(), mergeResult.taintedOperationCount());
++
++        // After merge, group ticks into independent components
++        net.minecraft.server.level.mica.OperationId[] tickOpIds = new OperationId[ticks.size()];
++        for (int i = 0; i < ticks.size(); i++) {
++            tickOpIds[i] = tickPosToOp.get(ticks.get(i).pos().asLong());
++        }
++
++        net.minecraft.server.level.mica.TickGrouper.GroupResult groupResult =
++            net.minecraft.server.level.mica.TickGrouper.groupTicks(
++                activeOverlays, ticks.size(), threadCount, batchSize,
++                mergeResult.taintedOperations(), tickOpIds);
++
++        // Process tainted groups first — serial re-run against live world
++        for (var group : groupResult.groups()) {
++            if (!group.tainted()) continue;
++
++            ServerChunkCache.MICA_LOGGER.info("[Mica/Scheduled] tick {} group {} is tainted, re-running.",
++                this.micaScheduledTickCount, group.hashCode());
++
++
++            for (int tickIdx : group.tickIndices()) {
++                var tick = ticks.get(tickIdx);
++
++                if (isBlockTick) {
++                    ((net.minecraft.world.ticks.LevelTicks<net.minecraft.world.level.block.Block>) this.getBlockTicks())
++                        .markTickExecuted((net.minecraft.world.ticks.ScheduledTick<net.minecraft.world.level.block.Block>) tick);
++                } else {
++                    ((net.minecraft.world.ticks.LevelTicks<net.minecraft.world.level.material.Fluid>) this.getFluidTicks())
++                        .markTickExecuted((net.minecraft.world.ticks.ScheduledTick<net.minecraft.world.level.material.Fluid>) tick);
++                }
++
++                ServerChunkCache.MICA_LOGGER.info("[Mica/Scheduled] - re-executed tainted tick. Sub-tick order {} @ {} / state {}",
++                    tick.subTickOrder(), tick.pos(), this.getBlockState(tick.pos()));
+ 
+-        // Replay deferred scheduled ticks — but only if no re-run happened
+-        if (!mergeResult.taintedOperations().isEmpty()) {
+-            ServerChunkCache.MICA_LOGGER.info("[Mica/Scheduled] TAINTED — re-running {} ticks serially", ticks.size());
+-            // Discard ALL parallel results — run everything serially against the live world
+-            // This is identical to vanilla execution
+-            for (var tick : ticks) {
+                 if (isBlockTick) {
+                     net.minecraft.world.level.block.state.BlockState state = this.getBlockState(tick.pos());
++
+                     if (state.is((net.minecraft.world.level.block.Block) tick.type())) {
+                         state.tick(this, tick.pos(), this.random);
+                     }
+@@ -900,89 +929,135 @@ public class ServerLevel extends Level implements ServerEntityGetter, WorldGenLe
+                 }
+             }
+         }
+-        else {
+-            int deferredTickCount = 0;
+-            for (int t = 0; t < threadCount; t++) {
+-                if (overlays[t].deferredEffects != null) {
+-                    deferredTickCount += overlays[t].deferredEffects.getScheduledTicks().size();
+-                }
+-            }
+-            ServerChunkCache.MICA_LOGGER.info("[Mica/Scheduled] CLEAN — {} writes, {} deferred ticks",
+-                mergeResult.cleanWrites().size(), deferredTickCount);
+-            // Apply ALL writes to live world (single pass)
+-            for (var entry : mergeResult.cleanWrites().long2ObjectEntrySet()) {
+-                net.minecraft.core.BlockPos pos = net.minecraft.core.BlockPos.of(entry.getLongKey());
+-                this.micaRawSetBlock(pos, entry.getValue());
+-            }
+ 
+-            // Replay deferred scheduled ticks
+-            for (int t = 0; t < threadCount; t++) {
+-                if (overlays[t].deferredEffects != null) {
+-                    for (var st : overlays[t].deferredEffects.getScheduledTicks()) {
+-                        if (st.isBlock()) {
+-                            this.getBlockTicks().schedule((net.minecraft.world.ticks.ScheduledTick) st.tick());
+-                        } else {
+-                            this.getFluidTicks().schedule((net.minecraft.world.ticks.ScheduledTick) st.tick());
++        net.minecraft.core.BlockPos repeaterOne = new BlockPos(-95, 67, -133);
++        net.minecraft.core.BlockPos repeaterTwo = new BlockPos(-95, 67, -133);
++
++        // Then apply clean groups' parallel results
++        for (var group : groupResult.groups()) {
++            if (!group.tainted()) {
++
++                // Apply this group's parallel results
++                for (int tickIdx : group.tickIndices()) {
++                    OperationId opId = tickOpIds[tickIdx];
++                    if (opId == null) continue;
++
++                    var tick = ticks.get(tickIdx);
++
++                    // Find and apply writes from this operation
++                    int threadIdx = tickIdx / batchSize;
++                    if (threadIdx >= threadCount) continue;
++                    TrackedOverlay overlay = overlays[threadIdx];
++
++                    for (var entry : overlay.getWriteProvenance().long2ObjectEntrySet()) {
++                        if (entry.getValue().equals(opId)) {
++                            net.minecraft.core.BlockPos pos = net.minecraft.core.BlockPos.of(entry.getLongKey());
++
++                            if(pos.equals(repeaterOne) || pos.equals(repeaterTwo))
++                            {
++                                ServerChunkCache.MICA_LOGGER.info("[Mica/Scheduled] - Applying tick {}. Sub-tick order {} @ {} / state {}, new {}",
++                                    micaScheduledTickCount, tick.subTickOrder(), tick.pos(), this.getBlockState(tick.pos()), overlay.getBlockWrites().get(entry.getLongKey()));
++
++                            }
++
++                            this.micaRawSetBlock(pos, overlay.getBlockWrites().get(entry.getLongKey()));
++
++                            // Send block changed notification.
++                            this.getChunkSource().blockChanged(pos);
++                        }
++                    }
++
++                    // Replay this operation's deferred scheduled ticks
++                    if (overlay.deferredEffects != null) {
++                        for (var st : overlay.deferredEffects.getScheduledTicks()) {
++                            if (st.sourceOp() != null && st.sourceOp().equals(opId)) {
++                                if (st.isBlock()) {
++                                    this.getBlockTicks().schedule((net.minecraft.world.ticks.ScheduledTick) st.tick());
++                                } else {
++                                    this.getFluidTicks().schedule((net.minecraft.world.ticks.ScheduledTick) st.tick());
++                                }
++                            }
+                         }
+                     }
+                 }
+             }
++        }
+ 
+-            // Apply deferred effects
+-            for (int t = 0; t < threadCount; t++) {
+-                if (overlays[t].deferredEffects != null && !overlays[t].deferredEffects.isEmpty()) {
+-                    overlays[t].deferredEffects.apply(this);
++        // Determine which overlays had tainted operations
++        java.util.Set<Integer> taintedOverlayIndices = new java.util.HashSet<>();
++        for (var group : groupResult.groups()) {
++            if (group.tainted()) {
++                for (int tickIdx : group.tickIndices()) {
++                    int threadIdx = tickIdx / batchSize;
++                    if (threadIdx < threadCount) {
++                        taintedOverlayIndices.add(threadIdx);
++                    }
+                 }
+             }
++        }
+ 
+-            // Collect and execute ticks due for this game tick serially
+-            // Mica - drain same-tick cascades until stable
+-            if (isBlockTick) {
+-                long currentTick = this.getGameTime();
+-                while (true) {
+-                    java.util.List<net.minecraft.world.ticks.ScheduledTick<net.minecraft.world.level.block.Block>> cascadeTicks =
+-                        ((net.minecraft.world.ticks.LevelTicks<net.minecraft.world.level.block.Block>) this.getBlockTicks())
+-                            .collectForParallelDispatch(currentTick, 65536);
+-                    if (cascadeTicks.isEmpty()) {
+-                        ((net.minecraft.world.ticks.LevelTicks<net.minecraft.world.level.block.Block>) this.getBlockTicks())
+-                            .finishParallelDispatch();
+-                        break;
+-                    }
+-                    for (var tick : cascadeTicks) {
+-                        net.minecraft.world.level.block.state.BlockState state = this.getBlockState(tick.pos());
+-                        if (state.is((net.minecraft.world.level.block.Block) tick.type())) {
+-                            state.tick(this, tick.pos(), this.random);
+-                        }
+-                    }
++        // Apply deferred effects only from clean overlays
++        // (Tainted operations re-ran serially, producing effects directly)
++        for (int t = 0; t < threadCount; t++) {
++            if (taintedOverlayIndices.contains(t)) continue;
++            if (overlays[t].deferredEffects != null && !overlays[t].deferredEffects.isEmpty()) {
++                overlays[t].deferredEffects.apply(this);
++            }
++        }
++
++        // Drain same-tick cascades
++        if (isBlockTick) {
++            long currentTick = this.getGameTime();
++            while (true) {
++                java.util.List<net.minecraft.world.ticks.ScheduledTick<net.minecraft.world.level.block.Block>> cascadeTicks =
++                    ((net.minecraft.world.ticks.LevelTicks<net.minecraft.world.level.block.Block>) this.getBlockTicks())
++                        .collectForParallelDispatch(currentTick, 65536);
++                if (cascadeTicks.isEmpty()) {
+                     ((net.minecraft.world.ticks.LevelTicks<net.minecraft.world.level.block.Block>) this.getBlockTicks())
+                         .finishParallelDispatch();
++                    break;
+                 }
+-            } else {
+-                long currentTick = this.getGameTime();
+-                while (true) {
+-                    java.util.List<net.minecraft.world.ticks.ScheduledTick<net.minecraft.world.level.material.Fluid>> cascadeTicks =
+-                        ((net.minecraft.world.ticks.LevelTicks<net.minecraft.world.level.material.Fluid>) this.getFluidTicks())
+-                            .collectForParallelDispatch(currentTick, 65536);
+-                    if (cascadeTicks.isEmpty()) {
+-                        ((net.minecraft.world.ticks.LevelTicks<net.minecraft.world.level.material.Fluid>) this.getFluidTicks())
+-                            .finishParallelDispatch();
+-                        break;
+-                    }
+-                    for (var tick : cascadeTicks) {
+-                        net.minecraft.world.level.block.state.BlockState blockState = this.getBlockState(tick.pos());
+-                        net.minecraft.world.level.material.FluidState fluidState = blockState.getFluidState();
+-                        if (fluidState.is((net.minecraft.world.level.material.Fluid) tick.type())) {
+-                            fluidState.tick(this, tick.pos(), blockState);
+-                        }
++                for (var tick : cascadeTicks) {
++                    net.minecraft.world.level.block.state.BlockState state = this.getBlockState(tick.pos());
++                    if (state.is((net.minecraft.world.level.block.Block) tick.type())) {
++                        state.tick(this, tick.pos(), this.random);
+                     }
++                }
++                ((net.minecraft.world.ticks.LevelTicks<net.minecraft.world.level.block.Block>) this.getBlockTicks())
++                    .finishParallelDispatch();
++            }
++        } else {
++            long currentTick = this.getGameTime();
++            while (true) {
++                java.util.List<net.minecraft.world.ticks.ScheduledTick<net.minecraft.world.level.material.Fluid>> cascadeTicks =
++                    ((net.minecraft.world.ticks.LevelTicks<net.minecraft.world.level.material.Fluid>) this.getFluidTicks())
++                        .collectForParallelDispatch(currentTick, 65536);
++                if (cascadeTicks.isEmpty()) {
+                     ((net.minecraft.world.ticks.LevelTicks<net.minecraft.world.level.material.Fluid>) this.getFluidTicks())
+                         .finishParallelDispatch();
++                    break;
+                 }
++                for (var tick : cascadeTicks) {
++                    net.minecraft.world.level.block.state.BlockState blockState = this.getBlockState(tick.pos());
++                    net.minecraft.world.level.material.FluidState fluidState = blockState.getFluidState();
++                    if (fluidState.is((net.minecraft.world.level.material.Fluid) tick.type())) {
++                        fluidState.tick(this, tick.pos(), blockState);
++                    }
++                }
++                ((net.minecraft.world.ticks.LevelTicks<net.minecraft.world.level.material.Fluid>) this.getFluidTicks())
++                    .finishParallelDispatch();
+             }
+-
+         }
+ 
+         // Log stats
++        int cleanGroups = 0, taintedGroups = 0;
++        for (var group : groupResult.groups()) {
++            if (group.tainted()) taintedGroups++;
++            else cleanGroups++;
++        }
++        // ServerChunkCache.MICA_LOGGER.info("[Mica/Scheduled] {} groups ({} clean, {} tainted) from {} ticks",
++        //     groupResult.groups().size(), cleanGroups, taintedGroups, ticks.size());
++
+         micaScheduledTickCumTaint += mergeResult.taintedOperationCount();
+         micaScheduledTickCumConf += mergeResult.conflictCount();
+ 
+@@ -993,10 +1068,10 @@ public class ServerLevel extends Level implements ServerEntityGetter, WorldGenLe
+                 totalReads += overlays[t].getReadCount();
+                 totalWrites += overlays[t].getWriteCount();
+             }
+-            ServerChunkCache.MICA_LOGGER.info("[Mica/Scheduled] {} | {} threads | {} ticks | {} reads, {} writes | {} conflicts, {} tainted",
+-                isBlockTick ? "blocks" : "fluids",
+-                threadCount, ticks.size(), totalReads, totalWrites,
+-                micaScheduledTickCumConf, micaScheduledTickCumTaint);
++            // ServerChunkCache.MICA_LOGGER.info("[Mica/Scheduled] {} | {} threads | {} ticks | {} reads, {} writes | {} conflicts, {} tainted",
++            //     isBlockTick ? "blocks" : "fluids",
++            //     threadCount, ticks.size(), totalReads, totalWrites,
++            //     micaScheduledTickCumConf, micaScheduledTickCumTaint);
+             micaScheduledTickCumConf = 0;
+             micaScheduledTickCumTaint = 0;
+         }
+@@ -1054,6 +1129,12 @@ public class ServerLevel extends Level implements ServerEntityGetter, WorldGenLe
+         if (!this.isDebug() && runsNormally) {
+             long l = this.getGameTime();
+ 
++            // profilerFiller.push("blockTicks");
++            // this.blockTicks.tick(l, paperConfig().environment.maxBlockTicks, this::tickBlock);
++            // profilerFiller.popPush("fluidTicks");
++            // this.fluidTicks.tick(l, paperConfig().environment.maxFluidTicks, this::tickFluid);
++            // profilerFiller.pop();
++
+             // Mica start - parallel scheduled ticks
+             profilerFiller.push("blockTicks");
+             java.util.List<net.minecraft.world.ticks.ScheduledTick<net.minecraft.world.level.block.Block>> blockTickList =
+diff --git a/net/minecraft/server/level/mica/TickGrouper.java b/net/minecraft/server/level/mica/TickGrouper.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..530ba2fcd12ab0857ec90908298954cf7d5de547
+--- /dev/null
++++ b/net/minecraft/server/level/mica/TickGrouper.java
+@@ -0,0 +1,174 @@
++// ============================================================================
++// TickGrouper
++// ============================================================================
++//
++// After parallel scheduled tick execution, groups ticks into independent
++// connected components based on their read/write/cascade overlap.
++// Components with no internal conflicts keep their parallel results.
++// Components with conflicts get re-run serially.
++//
++// Uses Union-Find (disjoint set) for efficient grouping.
++
++package net.minecraft.server.level.mica;
++
++import it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap;
++import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
++import java.util.ArrayList;
++import java.util.HashSet;
++import java.util.List;
++import java.util.Set;
++
++public class TickGrouper {
++
++    /**
++     * Result of grouping: a list of tick groups, each marked as clean or tainted.
++     */
++    public record GroupResult(List<TickGroup> groups) {}
++
++    /**
++     * A group of tick indices that form a connected component.
++     * If tainted, the entire group must be re-run serially.
++     */
++    public record TickGroup(List<Integer> tickIndices, boolean tainted) {}
++
++    /**
++     * Union-Find with path compression and union by rank.
++     */
++    private static class UnionFind {
++        private final int[] parent;
++        private final int[] rank;
++
++        UnionFind(int size) {
++            parent = new int[size];
++            rank = new int[size];
++            for (int i = 0; i < size; i++) {
++                parent[i] = i;
++            }
++        }
++
++        int find(int x) {
++            if (parent[x] != x) {
++                parent[x] = find(parent[x]); // path compression
++            }
++            return parent[x];
++        }
++
++        void union(int a, int b) {
++            int ra = find(a);
++            int rb = find(b);
++            if (ra == rb) return;
++            // union by rank
++            if (rank[ra] < rank[rb]) {
++                parent[ra] = rb;
++            } else if (rank[ra] > rank[rb]) {
++                parent[rb] = ra;
++            } else {
++                parent[rb] = ra;
++                rank[ra]++;
++            }
++        }
++    }
++
++    /**
++     * Group ticks into connected components based on position overlap.
++     *
++     * Two ticks are in the same group if they share any position through:
++     * - Write-write overlap (both wrote to same position)
++     * - Write-read overlap (one wrote, other read same position)
++     * - Touched-read overlap (one's cascade touched a position the other read)
++     *
++     * @param overlays    The per-thread overlays from parallel execution
++     * @param tickCount   Total number of ticks that were dispatched
++     * @param threadCount Number of threads used
++     * @param batchSize   Size of each thread's batch (for mapping tick index → thread)
++     * @param taintedOps  Set of tainted OperationIds from the merger
++     * @param tickOpIds   Array mapping tick index → OperationId
++     */
++    public static GroupResult groupTicks(
++        List<TrackedOverlay> overlays,
++        int tickCount,
++        int threadCount,
++        int batchSize,
++        Set<OperationId> taintedOps,
++        OperationId[] tickOpIds
++    ) {
++        if (tickCount == 0) {
++            return new GroupResult(new ArrayList<>());
++        }
++
++        UnionFind uf = new UnionFind(tickCount);
++
++        // Build position → tick index mapping
++        // For each position that any tick wrote, read, or touched,
++        // record which tick indices are involved
++        Long2IntOpenHashMap positionToFirstTick = new Long2IntOpenHashMap();
++        positionToFirstTick.defaultReturnValue(-1);
++
++        for (int tickIdx = 0; tickIdx < tickCount; tickIdx++) {
++            int threadIdx = tickIdx / batchSize;
++            if (threadIdx >= threadCount) break;
++
++            TrackedOverlay overlay = overlays.get(threadIdx);
++            OperationId opId = tickOpIds[tickIdx];
++            if (opId == null) continue;
++
++            // Collect all positions this tick is involved with
++            LongOpenHashSet involvedPositions = new LongOpenHashSet();
++
++            // Positions this tick wrote
++            for (var entry : overlay.getWriteProvenance().long2ObjectEntrySet()) {
++                if (entry.getValue().equals(opId)) {
++                    involvedPositions.add(entry.getLongKey());
++                }
++            }
++
++            // Positions this tick read
++            for (TrackedOverlay.ReadRecord record : overlay.getOperationReads()) {
++                if (record.opId().equals(opId)) {
++                    involvedPositions.add(record.pos());
++                }
++            }
++
++            // Positions this tick's cascade touched
++            // (touchedPositions are per-overlay, not per-operation,
++            //  but during scheduled ticks each thread typically runs
++            //  one operation at a time, so they're effectively per-operation)
++
++            // Union this tick with any previous tick that shares a position
++            for (long pos : involvedPositions) {
++                int prev = positionToFirstTick.get(pos);
++                if (prev == -1) {
++                    positionToFirstTick.put(pos, tickIdx);
++                } else {
++                    uf.union(prev, tickIdx);
++                }
++            }
++        }
++
++        // Extract connected components
++        java.util.Map<Integer, List<Integer>> components = new java.util.HashMap<>();
++        for (int i = 0; i < tickCount; i++) {
++            int root = uf.find(i);
++            components.computeIfAbsent(root, k -> new ArrayList<>()).add(i);
++        }
++
++        // Determine which components are tainted
++        List<TickGroup> groups = new ArrayList<>();
++        for (var entry : components.entrySet()) {
++            List<Integer> indices = entry.getValue();
++            boolean groupTainted = false;
++
++            for (int idx : indices) {
++                OperationId opId = tickOpIds[idx];
++                if (opId != null && taintedOps.contains(opId)) {
++                    groupTainted = true;
++                    break;
++                }
++            }
++
++            groups.add(new TickGroup(indices, groupTainted));
++        }
++
++        return new GroupResult(groups);
++    }
++}
+diff --git a/net/minecraft/world/ticks/LevelTicks.java b/net/minecraft/world/ticks/LevelTicks.java
+index b19edd136ac52ceb32be386314bbf64459ea1bee..59c52e44373795b92b2e16e37b4e4a6bdff46e1a 100644
+--- a/net/minecraft/world/ticks/LevelTicks.java
++++ b/net/minecraft/world/ticks/LevelTicks.java
+@@ -93,6 +93,14 @@ public class LevelTicks<T> implements LevelTickAccess<T> {
+         }
+     }
+ 
++    // Mica start - remove a single tick from the run set (matches vanilla's per-tick removal)
++    public void markTickExecuted(ScheduledTick<T> tick) {
++        if (!this.toRunThisTickSet.isEmpty()) {
++            this.toRunThisTickSet.remove(tick);
++        }
++    }
++    // Mica end
++
+     // Mica start - expose tick collection for parallel dispatch
+     public java.util.List<ScheduledTick<T>> collectForParallelDispatch(long gameTime, int maxAllowedTicks) {
+         ProfilerFiller profilerFiller = Profiler.get();
+@@ -100,13 +108,17 @@ public class LevelTicks<T> implements LevelTickAccess<T> {
+         this.collectTicks(gameTime, maxAllowedTicks, profilerFiller);
+         profilerFiller.pop();
+ 
++        // Eagerly populate toRunThisTickSet BEFORE draining toRunThisTick,
++        // so willTickThisTick works correctly during execution.
++        // In vanilla, calculateTickSetIfNeeded lazily builds this from toRunThisTick,
++        // but we're about to drain toRunThisTick so it must be built now.
++        this.calculateTickSetIfNeeded();
++
+         // Drain into a list for external dispatch
+         java.util.List<ScheduledTick<T>> collected = new java.util.ArrayList<>(this.toRunThisTick.size());
+         while (!this.toRunThisTick.isEmpty()) {
+             ScheduledTick<T> tick = this.toRunThisTick.poll();
+-            if (!this.toRunThisTickSet.isEmpty()) {
+-                this.toRunThisTickSet.remove(tick);
+-            }
++            // DON'T remove from toRunThisTickSet — markTickExecuted handles per-tick removal
+             this.alreadyRunThisTick.add(tick);
+             collected.add(tick);
+         }
