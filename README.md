@@ -4,21 +4,21 @@
 
 Mica adds transparent multi-threaded tick execution to the Minecraft server using a Snapshot-Compute-Merge-Converge (SCMC) architecture. Unlike [Folia](https://papermc.io/software/folia), which splits the world into independent regions that cannot interact, Mica maintains a single unified world where all game systems can read the same global state. Parallelism comes from snapshot isolation, not spatial partitioning.
 
-> **Status: Early experimental.** Random chunk ticks are parallelized. Entity ticking, block entity ticking, and scheduled ticks are not yet parallelized. Not ready for production use.
+> **Status: Experimental.** Random ticks, entity ticks, and scheduled block/fluid ticks are parallelized. Redstone circuits work correctly with all three Paper evaluators (Vanilla, Eigencraft, Alternate Current). Not ready for production use.
 
 ## How It Works
 
-Every Minecraft server tick (50ms), the server processes block updates, entity AI, mob spawning, crop growth, redstone, fluid flow, and more all on a single thread. Mica changes this:
+Every Minecraft server tick (50ms), the server processes block updates, entity AI, mob spawning, crop growth, redstone, fluid flow, and more, all on a single thread. Mica changes this:
 
 ### The SCMC Cycle
 
-1. **Snapshot** - At tick start, capture an immutable view of the world state. This is O(1) using copy-on-write references to chunk section arrays.
+1. **Snapshot** - At tick start, capture an immutable view of the world state. This is O(1) using copy-on-write references to chunk section arrays - no deep copy.
 
-2. **Compute** - Dispatch tick operations across a thread pool. Each worker thread gets a *tracked overlay*, a read-write layer on top of the snapshot. Game code calls `level.getBlockState()` and `level.setBlock()` as usual, but these calls are transparently redirected to the overlay via thread-local interception. Reads check the overlay first, then fall through to the snapshot. Writes go into the overlay only.
+2. **Compute** - Dispatch tick operations across a thread pool. Each worker thread gets a *tracked overlay* - a read-write layer on top of the snapshot. Game code calls `level.getBlockState()` and `level.setBlock()` as usual, but these calls are transparently redirected to the overlay via thread-local interception. Reads check the overlay first, then fall through to the snapshot. Writes go into the overlay only.
 
 3. **Merge** - Collect all overlays. Most writes don't conflict (different positions). For conflicts, walk the provenance graph to identify exactly which operations are affected, and re-run only those operations serially.
 
-4. **Converge** - Commit merged writes to the live world. Replay deferred side effects (entity spawns, Bukkit events) on the main thread.
+4. **Apply** - Commit merged writes to the live world. Replay deferred side effects (entity spawns, Bukkit events) on the main thread.
 
 ### Why Not Regions?
 
@@ -33,21 +33,29 @@ Mica takes a different approach: all workers see the same global snapshot, so th
 
 When two workers' overlays conflict (writing to the same position, or one reading a position the other wrote), Mica doesn't throw away all work. Each overlay tracks which operation caused each read and write. The merge phase walks this provenance graph to find exactly the affected operations, discards only their results, and re-runs them serially. Everything else keeps its parallel results.
 
-In practice, conflicts are extremely rare. Empirical data from live testing shows random ticks have a conflict rate of effectively 0% even under extreme stress (100,000x tick speed, 9.5 million reads per interval).
+For cascading systems like redstone, Mica also tracks "touched positions", positions read during a neighbor update cascade triggered by a write. Even if the value didn't change, the position was causally influenced. If another thread read that position, a conflict is detected.
+
+After conflict detection, Mica groups ticks into independent connected components using Union-Find. Only tainted components are re-run. Clean components keep their parallel results. When multiple tainted components exist (e.g., 20 separate water pools flowing during chunk generation), they are re-run **in parallel with each other**, each group gets its own overlay and runs on a worker thread. This means even worst-case scenarios with many conflicts can still benefit from parallelism. Two independent redstone machines, or 20 separate lava flows, all execute concurrently.
+
+In practice, conflicts are rare for random ticks and entity ticks. Empirical data from live testing shows random ticks have a conflict rate of effectively 0% even under extreme stress (100,000x tick speed, 9.5 million reads per interval). Scheduled ticks with interacting redstone circuits produce conflicts that are detected and resolved automatically.
 
 ## Current State
 
 ### What's Parallelized
 - **Random block ticks** (crop growth, ice/snow formation, fire spread, leaf decay, etc.) - dispatched across a configurable thread pool with per-thread overlays
+- **Entity ticking** (AI, pathfinding, movement, collision) - 5,000+ villagers at 34ms on 8 threads with entity position snapshots for cross-entity read safety
+- **Scheduled block ticks** (redstone repeaters, comparators, gravity blocks) - with cascade conflict detection and independent tick grouping via Union-Find
+- **Scheduled fluid ticks** (water and lava flow)
 
 ### What's Deferred
 - **Entity spawns** during parallel ticks (e.g., item drops from leaf decay) are buffered and applied on the main thread after the parallel phase
 - **Bukkit events** that require the main thread (BlockSpreadEvent, BlockGrowEvent, etc.) are buffered and replayed
+- **Entity chunk moves** during parallel entity ticks are deferred to prevent concurrent modification of chunk entity lists
+- **Block entity creation/removal** during parallel block ticks
+- **Scheduled ticks** (scheduleTick calls during parallel phase) - tagged with source operation, replayed per-group after merge
 
 ### What's Not Yet Parallelized
-- Entity ticking (AI, pathfinding, movement) - the biggest performance target
 - Block entity ticking (hoppers, furnaces)
-- Scheduled block ticks (redstone, fluid flow)
 - Block events (pistons)
 
 ## Architecture
@@ -58,19 +66,27 @@ net.minecraft.server.level.mica/
 ├── TrackedOverlay.java        # Per-thread read-write layer with provenance tracking
 ├── OperationId.java           # Unique identifier for each tick operation
 ├── OperationType.java         # Enum of operation types (block tick, entity tick, etc.)
-├── OverlayMerger.java         # Conflict detection via provenance graph walking
+├── OverlayMerger.java         # Pre-indexed conflict detection via provenance graph walking
+├── TickGrouper.java           # Union-Find grouping of independent tick components + parallel re-run
 ├── MicaTickEngine.java        # SCMC cycle orchestrator
 ├── TickOperation.java         # Operation wrappers (BlockTickOp, EntityTickOp, etc.)
 ├── OperationExecutor.java     # Functional interface for executing operations
-└── DeferredEffects.java       # Buffers entity spawns, events for main thread replay
+└── DeferredEffects.java       # Buffers entity spawns, events, scheduled ticks for main thread replay
 ```
 
 Key integration points in the server:
-- `Level.java` - Thread-local intercepts on `getBlockState()`, `getFluidState()`, `setBlock()`
-- `ServerChunkCache.java` - Parallel dispatch in `iterateTickingChunksFaster()`
+- `LevelChunk.java` - Overlay intercept at chunk level (transparent to game logic above)
+- `Level.java` - Thread-local intercepts on `getBlockState()`, `getFluidState()`; suppresses packets/rendering in `notifyAndUpdatePhysics()` during parallel phase
+- `Entity.java` - Position/bounding box snapshots for cross-entity read safety
+- `ServerChunkCache.java` - Parallel dispatch in `iterateTickingChunksFaster()`; thread pool and logger
+- `ServerLevel.java` - Entity tick parallelism, scheduled tick parallelism (`micaRunScheduledTicks`)
+- `LevelTicks.java` - `collectForParallelDispatch()` / `finishParallelDispatch()` for tick collection
+- `EntityLookup.java` - Entity chunk movement and removal deferral during parallel phase
+- `OverlayMerger.java` - Pre-indexed position→reader and operation→position maps for O(1) conflict detection
+- `LevelHelper.java` - Alternate Current wire state overlay intercept
+- `RedStoneWireBlock.java` - ThreadLocal `shouldSignal` for vanilla redstone evaluator safety
 - `PaperEventManager.java` - Sync event deferral during parallel execution
-- `AsyncCatcher.java` - Worker thread bypass during parallel execution
-- `ServerLevel.java` - Entity spawn deferral during parallel execution
+- `AsyncCatcher.java` / `TickThread.java` - Worker thread bypass during parallel execution
 
 ## Comparison
 
@@ -78,10 +94,13 @@ Key integration points in the server:
 |---|---|---|---|
 | Threading model | Single-threaded tick | Regionized parallel | Snapshot-isolated parallel |
 | World model | One world, one thread | Independent regions | One world, parallel reads |
-| Plugin compatibility | Full | Requires rewrite | Mostly compatible |
+| Plugin compatibility | Full | Requires rewrite | Mostly compatible* |
 | Cross-region interaction | N/A | Async scheduling required | Transparent (snapshot) |
-| Best for | General use | Spread-out players | Any server with tick pressure |
-| Conflict handling | N/A | Forbidden | Automatic (provenance graph) |
+| Redstone correctness | Full | Per-region only | Full (conflict detection + serial fallback) |
+| Entity scaling | ~200 villagers/tick | Per-region | 5,000+ villagers on 8 threads |
+| Conflict handling | N/A | Forbidden | Automatic (provenance graph + Union-Find grouping) |
+
+*Cancellable Bukkit events during parallel execution are currently deferred - see HARDENING.md
 
 ## Roadmap
 
@@ -89,10 +108,23 @@ Key integration points in the server:
 - [x] Thread-local world access interception
 - [x] Parallel random chunk ticks
 - [x] Deferred entity spawns and Bukkit events
-- [ ] Parallel entity ticking
+- [x] Parallel entity ticking with position snapshots
+- [x] Parallel scheduled block and fluid ticks
+- [x] Cascade conflict detection (touched positions)
+- [x] Independent tick grouping (Union-Find connected components)
+- [x] Per-thread Alternate Current WireHandler
+- [x] Vanilla/Eigencraft redstone evaluator safety (ThreadLocal shouldSignal)
+- [x] Transparent overlay at LevelChunk level (vanilla game logic runs naturally)
+- [x] Full conflict detection with provenance graph walking
+- [x] Parallel re-run of independent tainted groups
+- [x] Pre-indexed merge and grouper (sub-millisecond with thousands of ticks)
+- [x] Entity removal deferral for chunk unload safety
+- [x] willTickThisTick correctness (markTickExecuted matching vanilla behavior)
+- [x] 10-player multiplayer stress test
+- [x] 4-bit adder timing verification
 - [ ] Parallel block entity ticking (hoppers, furnaces)
-- [ ] Parallel scheduled ticks (redstone, fluids)
-- [ ] Full conflict detection with provenance graph walking
+- [ ] Buffered block update packets to eliminate flicker
+- [ ] Cancellable Bukkit event support during parallel execution
 - [ ] Configurable thread count and subsystem opt-in
 - [ ] Performance benchmarking vs Paper and Folia
 - [ ] Plugin compatibility testing
@@ -114,7 +146,10 @@ Download or build the Mica jar and run it just like a Paper server.
 
 Mica logs parallel tick stats every 200 ticks:
 ```
-[Mica] Parallel random ticks: 4 threads, 441 chunks, 14199 reads, 26 writes, 26 deferred effects
+[Mica] 8 threads | 441 chunks | 98700246 reads, 80 writes | 0 conflicts, 0 tainted, 0 re-runs
+[Mica] Timing: 36.38ms total | snapshot 0.04ms | compute 36.14ms | merge 0.02ms | converge 0.00ms | apply 0.18ms
+[Mica] [Entities] 34.12ms | 8 threads | 5104 entities | 133583 reads, 0 writes, 0 deferred
+[Mica] [Mica/Scheduled] 4 groups (3 clean, 1 tainted) from 5 ticks
 ```
 
 * Paper documentation applies to Mica: [docs.papermc.io](https://docs.papermc.io)
@@ -191,16 +226,3 @@ Inherits Paper's license. See [LICENSE.md](LICENSE.md).
 ## Acknowledgements
 
 Built on [PaperMC](https://papermc.io) and the work of the Paper team, especially Spottedleaf's chunk system and Starlight lighting engine.
-
-Special thanks to:
-
-[![YourKit-Logo](https://www.yourkit.com/images/yklogo.png)](https://www.yourkit.com/)
-
-[YourKit](https://www.yourkit.com/), makers of the outstanding java profiler, support open source projects of all kinds with their full featured [Java](https://www.yourkit.com/java/profiler) and [.NET](https://www.yourkit.com/.net/profiler) application profilers. We thank them for granting Paper an OSS license so that we can make our software the best it can be.
-
-[<img src="https://user-images.githubusercontent.com/21148213/121807008-8ffc6700-cc52-11eb-96a7-2f6f260f8fda.png" alt="" width="150">](https://www.jetbrains.com)
-
-[JetBrains](https://www.jetbrains.com/), creators of the IntelliJ IDEA, supports Paper with one of their [Open Source Licenses](https://www.jetbrains.com/opensource/). IntelliJ IDEA is the recommended IDE for working with Paper, and most of the Paper team uses it.
-
-All our sponsors!
-[![Sponsor Image](https://raw.githubusercontent.com/PaperMC/papermc.io/data/sponsors.png)](https://papermc.io/sponsors)
