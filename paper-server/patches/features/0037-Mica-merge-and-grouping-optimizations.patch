@@ -1,0 +1,810 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grant Oberhauser <oberhausergrant@gmail.com>
+Date: Tue, 10 Mar 2026 18:49:18 -0700
+Subject: [PATCH] Mica: merge and grouping optimizations
+
+
+diff --git a/ca/spottedleaf/moonrise/patches/chunk_system/level/entity/EntityLookup.java b/ca/spottedleaf/moonrise/patches/chunk_system/level/entity/EntityLookup.java
+index 38692a70bb6478fcecdaa7312da42f474dfe0f42..a8377700bcdef559e80dacf2703129629d395384 100644
+--- a/ca/spottedleaf/moonrise/patches/chunk_system/level/entity/EntityLookup.java
++++ b/ca/spottedleaf/moonrise/patches/chunk_system/level/entity/EntityLookup.java
+@@ -1003,6 +1003,28 @@ public abstract class EntityLookup implements LevelEntityGetter<Entity> {
+ 
+         @Override
+         public void onRemove(final Entity.RemovalReason reason) {
++            // Mica start - defer entity removal during parallel execution
++            if (ca.spottedleaf.moonrise.common.util.TickThread.micaParallelPhase.get()) {
++                net.minecraft.server.level.mica.DeferredEffects deferred =
++                    net.minecraft.world.level.Level.micaDeferredStatic.get();
++                if (deferred != null) {
++                    final Entity removingEntity = this.entity;
++                    deferred.addDeferredTask(() -> {
++                        try {
++                            final Visibility tickingState = EntityLookup.getEntityStatus(removingEntity);
++                            EntityLookup.this.removeEntity(removingEntity);
++                            EntityLookup.this.entityStatusChange(removingEntity, null, tickingState, Visibility.HIDDEN, false, false, reason.shouldDestroy());
++                            EntityLookup.this.removeEntityCallback(removingEntity);
++                            removingEntity.setLevelCallback(NoOpCallback.INSTANCE);
++                        } catch (Throwable t) {
++                            // Entity state is stale — will self-correct
++                        }
++                    });
++                    return;
++                }
++            }
++            // Mica end
++
+             final Entity entity = this.entity;
+             EntityLookup.this.checkThread(entity, "Cannot remove entity off-main");
+             final Visibility tickingState = EntityLookup.getEntityStatus(entity);
+diff --git a/net/minecraft/server/level/ServerLevel.java b/net/minecraft/server/level/ServerLevel.java
+index b71b3a4c7c7004da6f62fd0bea98661f195b53e6..563e63b8e17eb4817a27f97429e87fffe628555d 100644
+--- a/net/minecraft/server/level/ServerLevel.java
++++ b/net/minecraft/server/level/ServerLevel.java
+@@ -878,72 +878,266 @@ public class ServerLevel extends Level implements ServerEntityGetter, WorldGenLe
+         net.minecraft.server.level.mica.OverlayMerger.MergeResult mergeResult =
+             net.minecraft.server.level.mica.OverlayMerger.merge(activeOverlays);
+ 
+-        // ServerChunkCache.MICA_LOGGER.info("[Mica/Scheduled] collected {} ticks, {} tainted",
+-        //     ticks.size(), mergeResult.taintedOperationCount());
++// =====================================================================
++        // POST-MERGE: Apply results or re-run tainted groups
++        // =====================================================================
+ 
+-        // After merge, group ticks into independent components
+-        net.minecraft.server.level.mica.OperationId[] tickOpIds = new OperationId[ticks.size()];
+-        for (int i = 0; i < ticks.size(); i++) {
+-            tickOpIds[i] = tickPosToOp.get(ticks.get(i).pos().asLong());
+-        }
++        // Fast path: no conflicts at all — skip grouping entirely
++        if (mergeResult.taintedOperations().isEmpty()) {
++            // Apply all writes
++            for (var entry : mergeResult.cleanWrites().long2ObjectEntrySet()) {
++                net.minecraft.core.BlockPos pos = net.minecraft.core.BlockPos.of(entry.getLongKey());
++                this.micaRawSetBlock(pos, entry.getValue());
++                this.getChunkSource().blockChanged(pos);
++            }
+ 
+-        net.minecraft.server.level.mica.TickGrouper.GroupResult groupResult =
+-            net.minecraft.server.level.mica.TickGrouper.groupTicks(
+-                activeOverlays, ticks.size(), threadCount, batchSize,
+-                mergeResult.taintedOperations(), tickOpIds);
++            // Replay all deferred scheduled ticks
++            for (int t = 0; t < threadCount; t++) {
++                if (overlays[t].deferredEffects != null) {
++                    for (var st : overlays[t].deferredEffects.getScheduledTicks()) {
++                        if (st.isBlock()) {
++                            this.getBlockTicks().schedule((net.minecraft.world.ticks.ScheduledTick) st.tick());
++                        } else {
++                            this.getFluidTicks().schedule((net.minecraft.world.ticks.ScheduledTick) st.tick());
++                        }
++                    }
++                }
++            }
+ 
+-        // Process tainted groups first — serial re-run against live world
+-        for (var group : groupResult.groups()) {
+-            if (!group.tainted()) continue;
++            // Apply other deferred effects
++            for (int t = 0; t < threadCount; t++) {
++                if (overlays[t].deferredEffects != null && !overlays[t].deferredEffects.isEmpty()) {
++                    overlays[t].deferredEffects.apply(this);
++                }
++            }
++        } else {
++            // Has conflicts — group ticks into independent components
+ 
+-            ServerChunkCache.MICA_LOGGER.info("[Mica/Scheduled] tick {} group {} is tainted, re-running.",
+-                this.micaScheduledTickCount, group.hashCode());
++            // Build tick → OperationId mapping
++            OperationId[] tickOpIds = new OperationId[ticks.size()];
++            for (int i = 0; i < ticks.size(); i++) {
++                tickOpIds[i] = tickPosToOp.get(ticks.get(i).pos().asLong());
++            }
+ 
++            // Build position index once — O(total_reads + total_writes)
++            java.util.Map<net.minecraft.server.level.mica.OperationId, it.unimi.dsi.fastutil.longs.LongOpenHashSet> positionIndex =
++                net.minecraft.server.level.mica.TickGrouper.buildPositionIndex(activeOverlays);
+ 
+-            for (int tickIdx : group.tickIndices()) {
+-                var tick = ticks.get(tickIdx);
++            // Group into independent components — O(total_positions)
++            net.minecraft.server.level.mica.TickGrouper.GroupResult groupResult =
++                net.minecraft.server.level.mica.TickGrouper.groupTicks(
++                    positionIndex, ticks.size(), mergeResult.taintedOperations(), tickOpIds);
+ 
+-                if (isBlockTick) {
+-                    ((net.minecraft.world.ticks.LevelTicks<net.minecraft.world.level.block.Block>) this.getBlockTicks())
+-                        .markTickExecuted((net.minecraft.world.ticks.ScheduledTick<net.minecraft.world.level.block.Block>) tick);
++            // Separate clean and tainted groups
++            java.util.List<net.minecraft.server.level.mica.TickGrouper.TickGroup> cleanGroups = new java.util.ArrayList<>();
++            java.util.List<net.minecraft.server.level.mica.TickGrouper.TickGroup> taintedGroups = new java.util.ArrayList<>();
++            for (var group : groupResult.groups()) {
++                if (group.tainted()) {
++                    taintedGroups.add(group);
+                 } else {
+-                    ((net.minecraft.world.ticks.LevelTicks<net.minecraft.world.level.material.Fluid>) this.getFluidTicks())
+-                        .markTickExecuted((net.minecraft.world.ticks.ScheduledTick<net.minecraft.world.level.material.Fluid>) tick);
++                    cleanGroups.add(group);
+                 }
++            }
+ 
+-                ServerChunkCache.MICA_LOGGER.info("[Mica/Scheduled] - re-executed tainted tick. Sub-tick order {} @ {} / state {}",
+-                    tick.subTickOrder(), tick.pos(), this.getBlockState(tick.pos()));
++            // --- Process tainted groups in parallel ---
++            // Each independent tainted group runs its ticks serially within its own
++            // context. Since groups share no positions by construction, they can
++            // safely execute in parallel against the live world — each group only
++            // touches blocks that no other group accesses.
++            //
++            // Note: we must ensure tainted groups complete BEFORE clean groups apply,
++            // because clean writes use micaRawSetBlock (no cascades), while tainted
++            // re-runs use vanilla setBlock (full cascades including scheduleTick).
+ 
+-                if (isBlockTick) {
+-                    net.minecraft.world.level.block.state.BlockState state = this.getBlockState(tick.pos());
++            if (taintedGroups.size() == 1) {
++                // Single tainted group — run serially on main thread, no overhead
++                var group = taintedGroups.get(0);
++                for (int tickIdx : group.tickIndices()) {
++                    var tick = ticks.get(tickIdx);
+ 
+-                    if (state.is((net.minecraft.world.level.block.Block) tick.type())) {
+-                        state.tick(this, tick.pos(), this.random);
++                    // Match vanilla: remove from toRunThisTickSet before execution
++                    if (isBlockTick) {
++                        ((net.minecraft.world.ticks.LevelTicks<net.minecraft.world.level.block.Block>) this.getBlockTicks())
++                            .markTickExecuted((net.minecraft.world.ticks.ScheduledTick<net.minecraft.world.level.block.Block>) tick);
++                    } else {
++                        ((net.minecraft.world.ticks.LevelTicks<net.minecraft.world.level.material.Fluid>) this.getFluidTicks())
++                            .markTickExecuted((net.minecraft.world.ticks.ScheduledTick<net.minecraft.world.level.material.Fluid>) tick);
+                     }
+-                } else {
+-                    net.minecraft.world.level.block.state.BlockState blockState = this.getBlockState(tick.pos());
+-                    net.minecraft.world.level.material.FluidState fluidState = blockState.getFluidState();
+-                    if (fluidState.is((net.minecraft.world.level.material.Fluid) tick.type())) {
+-                        fluidState.tick(this, tick.pos(), blockState);
++
++                    if (isBlockTick) {
++                        net.minecraft.world.level.block.state.BlockState state = this.getBlockState(tick.pos());
++                        if (state.is((net.minecraft.world.level.block.Block) tick.type())) {
++                            state.tick(this, tick.pos(), this.random);
++                        }
++                    } else {
++                        net.minecraft.world.level.block.state.BlockState blockState = this.getBlockState(tick.pos());
++                        net.minecraft.world.level.material.FluidState fluidState = blockState.getFluidState();
++                        if (fluidState.is((net.minecraft.world.level.material.Fluid) tick.type())) {
++                            fluidState.tick(this, tick.pos(), blockState);
++                        }
+                     }
+                 }
+-            }
+-        }
++            } else if (taintedGroups.size() > 1) {
++                // Multiple independent tainted groups — run in parallel
++                // Each group gets dispatched to a worker thread and runs its ticks
++                // serially against the live world. Groups are independent (no shared
++                // positions), so concurrent writes to different positions are safe.
++                //
++                // We use overlays for each group so writes don't race on chunk palettes.
++                // After all groups complete, we merge their overlays (guaranteed clean)
++                // and apply to the live world.
++
++                final net.minecraft.server.level.mica.WorldSnapshot rerunSnapshot =
++                    net.minecraft.server.level.mica.WorldSnapshot.capture(this);
++
++                final net.minecraft.server.level.mica.TrackedOverlay[] groupOverlays =
++                    new net.minecraft.server.level.mica.TrackedOverlay[taintedGroups.size()];
++                for (int g = 0; g < taintedGroups.size(); g++) {
++                    groupOverlays[g] = new net.minecraft.server.level.mica.TrackedOverlay(rerunSnapshot);
++                }
++
++                // Mark all tainted ticks as executed (for willTickThisTick correctness)
++                for (var group : taintedGroups) {
++                    for (int tickIdx : group.tickIndices()) {
++                        var tick = ticks.get(tickIdx);
++                        if (isBlockTick) {
++                            ((net.minecraft.world.ticks.LevelTicks<net.minecraft.world.level.block.Block>) this.getBlockTicks())
++                                .markTickExecuted((net.minecraft.world.ticks.ScheduledTick<net.minecraft.world.level.block.Block>) tick);
++                        } else {
++                            ((net.minecraft.world.ticks.LevelTicks<net.minecraft.world.level.material.Fluid>) this.getFluidTicks())
++                                .markTickExecuted((net.minecraft.world.ticks.ScheduledTick<net.minecraft.world.level.material.Fluid>) tick);
++                        }
++                    }
++                }
++
++                final java.util.concurrent.CountDownLatch groupLatch =
++                    new java.util.concurrent.CountDownLatch(taintedGroups.size());
++                final java.util.concurrent.atomic.AtomicReference<Throwable> groupError =
++                    new java.util.concurrent.atomic.AtomicReference<>();
++
++                for (int g = 0; g < taintedGroups.size(); g++) {
++                    final int groupIndex = g;
++                    final var group = taintedGroups.get(g);
++                    final net.minecraft.server.level.mica.TrackedOverlay groupOverlay = groupOverlays[g];
++
++                    ServerChunkCache.MICA_POOL.execute(() -> {
++                        try {
++                            ca.spottedleaf.moonrise.common.util.TickThread.micaParallelPhase.set(Boolean.TRUE);
++                            this.micaOverlay.set(groupOverlay);
++
++                            // Per-group deferred effects for scheduleTick
++                            net.minecraft.server.level.mica.DeferredEffects groupDeferred =
++                                new net.minecraft.server.level.mica.DeferredEffects();
++                            net.minecraft.world.level.Level.micaDeferredStatic.set(groupDeferred);
++
++                            // Per-group neighbor updater and wire handler
++                            net.minecraft.world.level.redstone.CollectingNeighborUpdater groupUpdater =
++                                new net.minecraft.world.level.redstone.CollectingNeighborUpdater(
++                                    this, this.getServer().getMaxChainedNeighborUpdates());
++                            net.minecraft.world.level.Level.micaNeighborUpdater.set(groupUpdater);
++
++                            alternate.current.wire.WireHandler groupWireHandler =
++                                new alternate.current.wire.WireHandler(this);
++                            Level.micaWireHandler.set(groupWireHandler);
++
++                            try {
++                                for (int tickIdx : group.tickIndices()) {
++                                    var tick = ticks.get(tickIdx);
++                                    if (isBlockTick) {
++                                        net.minecraft.world.level.block.state.BlockState state =
++                                            groupOverlay.getBlockState(tick.pos());
++                                        if (state.is((net.minecraft.world.level.block.Block) tick.type())) {
++                                            state.tick(this, tick.pos(), this.random);
++                                        }
++                                    } else {
++                                        net.minecraft.world.level.block.state.BlockState blockState =
++                                            groupOverlay.getBlockState(tick.pos());
++                                        net.minecraft.world.level.material.FluidState fluidState =
++                                            blockState.getFluidState();
++                                        if (fluidState.is((net.minecraft.world.level.material.Fluid) tick.type())) {
++                                            fluidState.tick(this, tick.pos(), blockState);
++                                        }
++                                    }
++                                }
++                            } finally {
++                                ca.spottedleaf.moonrise.common.util.TickThread.micaParallelPhase.set(Boolean.FALSE);
++                                this.micaOverlay.remove();
++                                net.minecraft.world.level.Level.micaDeferredStatic.remove();
++                                net.minecraft.world.level.Level.micaNeighborUpdater.remove();
++                                Level.micaWireHandler.remove();
++                            }
+ 
+-        net.minecraft.core.BlockPos repeaterOne = new BlockPos(-95, 67, -133);
+-        net.minecraft.core.BlockPos repeaterTwo = new BlockPos(-95, 67, -133);
++                            // Stash deferred effects on the overlay for later replay
++                            groupOverlay.deferredEffects = groupDeferred;
++
++                        } catch (Throwable t1) {
++                            groupError.compareAndSet(null, t1);
++                            ServerChunkCache.MICA_LOGGER.error(
++                                "[Mica] Error in tainted group {} re-run", groupIndex, t1);
++                        } finally {
++                            groupLatch.countDown();
++                        }
++                    });
++                }
++
++                try {
++                    groupLatch.await();
++                } catch (InterruptedException e) {
++                    Thread.currentThread().interrupt();
++                }
++
++                if (groupError.get() != null) {
++                    ServerChunkCache.MICA_LOGGER.error("[Mica] Tainted group re-run had errors, falling back to serial");
++                    // Fallback: re-run ALL tainted ticks serially on main thread
++                    for (var group : taintedGroups) {
++                        for (int tickIdx : group.tickIndices()) {
++                            var tick = ticks.get(tickIdx);
++                            if (isBlockTick) {
++                                net.minecraft.world.level.block.state.BlockState state = this.getBlockState(tick.pos());
++                                if (state.is((net.minecraft.world.level.block.Block) tick.type())) {
++                                    state.tick(this, tick.pos(), this.random);
++                                }
++                            } else {
++                                net.minecraft.world.level.block.state.BlockState blockState = this.getBlockState(tick.pos());
++                                net.minecraft.world.level.material.FluidState fluidState = blockState.getFluidState();
++                                if (fluidState.is((net.minecraft.world.level.material.Fluid) tick.type())) {
++                                    fluidState.tick(this, tick.pos(), blockState);
++                                }
++                            }
++                        }
++                    }
++                } else {
++                    // Apply all group overlay writes to live world
++                    for (int g = 0; g < taintedGroups.size(); g++) {
++                        for (var entry : groupOverlays[g].getBlockWrites().long2ObjectEntrySet()) {
++                            net.minecraft.core.BlockPos pos = net.minecraft.core.BlockPos.of(entry.getLongKey());
++                            this.micaRawSetBlock(pos, entry.getValue());
++                            this.getChunkSource().blockChanged(pos);
++                        }
+ 
+-        // Then apply clean groups' parallel results
+-        for (var group : groupResult.groups()) {
+-            if (!group.tainted()) {
++                        // Replay group deferred effects (scheduleTick, entity spawns, etc.)
++                        if (groupOverlays[g].deferredEffects != null) {
++                            for (var st : groupOverlays[g].deferredEffects.getScheduledTicks()) {
++                                if (st.isBlock()) {
++                                    this.getBlockTicks().schedule((net.minecraft.world.ticks.ScheduledTick) st.tick());
++                                } else {
++                                    this.getFluidTicks().schedule((net.minecraft.world.ticks.ScheduledTick) st.tick());
++                                }
++                            }
++                            if (!groupOverlays[g].deferredEffects.isEmpty()) {
++                                groupOverlays[g].deferredEffects.apply(this);
++                            }
++                        }
++                    }
++                }
++            }
+ 
+-                // Apply this group's parallel results
++            // --- Apply clean groups' parallel results ---
++            for (var group : cleanGroups) {
+                 for (int tickIdx : group.tickIndices()) {
+                     OperationId opId = tickOpIds[tickIdx];
+                     if (opId == null) continue;
+ 
+-                    var tick = ticks.get(tickIdx);
+-
+                     // Find and apply writes from this operation
+                     int threadIdx = tickIdx / batchSize;
+                     if (threadIdx >= threadCount) continue;
+@@ -952,17 +1146,7 @@ public class ServerLevel extends Level implements ServerEntityGetter, WorldGenLe
+                     for (var entry : overlay.getWriteProvenance().long2ObjectEntrySet()) {
+                         if (entry.getValue().equals(opId)) {
+                             net.minecraft.core.BlockPos pos = net.minecraft.core.BlockPos.of(entry.getLongKey());
+-
+-                            if(pos.equals(repeaterOne) || pos.equals(repeaterTwo))
+-                            {
+-                                ServerChunkCache.MICA_LOGGER.info("[Mica/Scheduled] - Applying tick {}. Sub-tick order {} @ {} / state {}, new {}",
+-                                    micaScheduledTickCount, tick.subTickOrder(), tick.pos(), this.getBlockState(tick.pos()), overlay.getBlockWrites().get(entry.getLongKey()));
+-
+-                            }
+-
+                             this.micaRawSetBlock(pos, overlay.getBlockWrites().get(entry.getLongKey()));
+-
+-                            // Send block changed notification.
+                             this.getChunkSource().blockChanged(pos);
+                         }
+                     }
+@@ -981,12 +1165,10 @@ public class ServerLevel extends Level implements ServerEntityGetter, WorldGenLe
+                     }
+                 }
+             }
+-        }
+ 
+-        // Determine which overlays had tainted operations
+-        java.util.Set<Integer> taintedOverlayIndices = new java.util.HashSet<>();
+-        for (var group : groupResult.groups()) {
+-            if (group.tainted()) {
++            // Apply deferred effects from clean overlays only
++            java.util.Set<Integer> taintedOverlayIndices = new java.util.HashSet<>();
++            for (var group : taintedGroups) {
+                 for (int tickIdx : group.tickIndices()) {
+                     int threadIdx = tickIdx / batchSize;
+                     if (threadIdx < threadCount) {
+@@ -994,18 +1176,20 @@ public class ServerLevel extends Level implements ServerEntityGetter, WorldGenLe
+                     }
+                 }
+             }
+-        }
+-
+-        // Apply deferred effects only from clean overlays
+-        // (Tainted operations re-ran serially, producing effects directly)
+-        for (int t = 0; t < threadCount; t++) {
+-            if (taintedOverlayIndices.contains(t)) continue;
+-            if (overlays[t].deferredEffects != null && !overlays[t].deferredEffects.isEmpty()) {
+-                overlays[t].deferredEffects.apply(this);
++            for (int t = 0; t < threadCount; t++) {
++                if (taintedOverlayIndices.contains(t)) continue;
++                if (overlays[t].deferredEffects != null && !overlays[t].deferredEffects.isEmpty()) {
++                    overlays[t].deferredEffects.apply(this);
++                }
+             }
++
++            // Log grouping stats
++            ServerChunkCache.MICA_LOGGER.info(
++                "[Mica/Scheduled] {} groups ({} clean, {} tainted) from {} ticks",
++                groupResult.groups().size(), cleanGroups.size(), taintedGroups.size(), ticks.size());
+         }
+ 
+-        // Drain same-tick cascades
++        // --- Same-tick cascade drain (always runs) ---
+         if (isBlockTick) {
+             long currentTick = this.getGameTime();
+             while (true) {
+@@ -1049,12 +1233,6 @@ public class ServerLevel extends Level implements ServerEntityGetter, WorldGenLe
+             }
+         }
+ 
+-        // Log stats
+-        int cleanGroups = 0, taintedGroups = 0;
+-        for (var group : groupResult.groups()) {
+-            if (group.tainted()) taintedGroups++;
+-            else cleanGroups++;
+-        }
+         // ServerChunkCache.MICA_LOGGER.info("[Mica/Scheduled] {} groups ({} clean, {} tainted) from {} ticks",
+         //     groupResult.groups().size(), cleanGroups, taintedGroups, ticks.size());
+ 
+diff --git a/net/minecraft/server/level/mica/OverlayMerger.java b/net/minecraft/server/level/mica/OverlayMerger.java
+index 9e603fe23e027770f611910a5414564fcfad7b04..51e11aac67c9d84e5aaf887d35154681a21f60be 100644
+--- a/net/minecraft/server/level/mica/OverlayMerger.java
++++ b/net/minecraft/server/level/mica/OverlayMerger.java
+@@ -38,6 +38,22 @@ public class OverlayMerger {
+      */
+     public static MergeResult merge(List<TrackedOverlay> overlays) {
+ 
++        // === Step 0: Build position → reader index ===
++        // Maps each position to the set of OperationIds that read it.
++        it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap<java.util.List<OperationId>> readersByPos =
++            new it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap<>();
++
++        for (TrackedOverlay overlay : overlays) {
++            for (TrackedOverlay.ReadRecord record : overlay.getOperationReads()) {
++                java.util.List<OperationId> readers = readersByPos.get(record.pos());
++                if (readers == null) {
++                    readers = new java.util.ArrayList<>(2);
++                    readersByPos.put(record.pos(), readers);
++                }
++                readers.add(record.opId());
++            }
++        }
++
+         // === Step 1: Find conflicting write positions ===
+         Long2IntOpenHashMap writeCountByPos = new Long2IntOpenHashMap();
+         writeCountByPos.defaultReturnValue(0);
+@@ -92,68 +108,58 @@ public class OverlayMerger {
+         }
+ 
+         // === Step 3: Check for read-write conflicts ===
+-        // Iterate writes (small set) and check if other overlays read those positions
++        // For each write position, look up readers from the index — O(1) per position
+         for (int i = 0; i < overlays.size(); i++) {
+             TrackedOverlay writerOverlay = overlays.get(i);
+             for (var writeEntry : writerOverlay.getWriteProvenance().long2ObjectEntrySet()) {
+                 long pos = writeEntry.getLongKey();
+                 OperationId writer = writeEntry.getValue();
+ 
+-                for (int j = 0; j < overlays.size(); j++) {
+-                    if (i == j) continue;
++                java.util.List<OperationId> readers = readersByPos.get(pos);
++                if (readers == null) continue;
+ 
+-                    if (overlays.get(j).getReadPositions().contains(pos)) {
+-                        taintedOps.add(writer);
+-
+-                        for (TrackedOverlay.ReadRecord record : overlays.get(j).getOperationReads()) {
+-                            if (record.pos() == pos) {
+-                                taintedOps.add(record.opId());
+-                            }
+-                        }
+-                    }
++                for (OperationId reader : readers) {
++                    // Skip same-overlay reads (thread reading its own write is fine)
++                    if (reader.threadIndex() == i) continue;
++                    // Taint both writer and reader
++                    taintedOps.add(writer);
++                    taintedOps.add(reader);
+                 }
+             }
+         }
+ 
+         // === Step 3b: Check for cascade-read conflicts ===
+         // If Thread A's cascade touched a position that Thread B read,
+-        // those operations are in conflict even though no write occurred
+-        // at that position. The cascade means the position's significance
+-        // was evaluated as part of Thread A's operation — if Thread A had
+-        // run first, the outcome at that position might have been different.
++        // those operations conflict even though no write occurred at that position.
+         for (int i = 0; i < overlays.size(); i++) {
+             TrackedOverlay toucherOverlay = overlays.get(i);
+             it.unimi.dsi.fastutil.longs.LongOpenHashSet touched = toucherOverlay.getTouchedPositions();
+-
+             if (touched.isEmpty()) continue;
+ 
+-            for (int j = 0; j < overlays.size(); j++) {
+-                if (i == j) continue;
+-
+-                TrackedOverlay readerOverlay = overlays.get(j);
+-
+-                // Find positions that overlay i's cascade touched AND overlay j read
+-                for (long touchedPos : touched) {
+-                    // Skip if this was already a write — handled in Step 3
+-                    if (toucherOverlay.hasWrite(touchedPos)) continue;
+-
+-                    if (readerOverlay.getReadPositions().contains(touchedPos)) {
+-                        // Find the operation that caused the cascade on overlay i
+-                        // The touched position was read during a cascade, so find
+-                        // which operation's reads include this position
+-                        for (TrackedOverlay.ReadRecord record : toucherOverlay.getOperationReads()) {
+-                            if (record.pos() == touchedPos) {
+-                                taintedOps.add(record.opId());
+-                                break;
+-                            }
+-                        }
++            for (long touchedPos : touched) {
++                // Skip if already a write — handled in Step 3
++                if (toucherOverlay.hasWrite(touchedPos)) continue;
++
++                java.util.List<OperationId> readers = readersByPos.get(touchedPos);
++                if (readers == null || readers.size() < 2) continue;
++
++                // If multiple operations from different threads read this touched position,
++                // and one of them is on the toucher overlay, they conflict.
++                // Find readers from this overlay vs other overlays.
++                OperationId toucherOp = null;
++                for (OperationId r : readers) {
++                    if (r.threadIndex() == i) {
++                        toucherOp = r;
++                        break;
++                    }
++                }
+ 
+-                        // Find the operations on overlay j that read this position
+-                        for (TrackedOverlay.ReadRecord record : readerOverlay.getOperationReads()) {
+-                            if (record.pos() == touchedPos) {
+-                                taintedOps.add(record.opId());
+-                            }
+-                        }
++                if (toucherOp == null) continue;
++
++                for (OperationId reader : readers) {
++                    if (reader.threadIndex() != i) {
++                        taintedOps.add(toucherOp);
++                        taintedOps.add(reader);
+                     }
+                 }
+             }
+@@ -171,55 +177,55 @@ public class OverlayMerger {
+         }
+ 
+         // === Step 4: Transitive closure via targeted BFS ===
+-        // Walk from tainted operations to find all transitively affected operations
++        // Build operation → written positions index for O(1) BFS walks
++        java.util.Map<OperationId, it.unimi.dsi.fastutil.longs.LongOpenHashSet> writesByOp =
++            new java.util.HashMap<>();
++        for (TrackedOverlay overlay : overlays) {
++            for (var entry : overlay.getWriteProvenance().long2ObjectEntrySet()) {
++                writesByOp.computeIfAbsent(entry.getValue(), k ->
++                    new it.unimi.dsi.fastutil.longs.LongOpenHashSet()).add(entry.getLongKey());
++            }
++        }
++
+         java.util.ArrayDeque<OperationId> worklist = new java.util.ArrayDeque<>(taintedOps);
+ 
+         while (!worklist.isEmpty()) {
+             OperationId tainted = worklist.poll();
+ 
+-            // Find positions this tainted operation wrote to
+-            for (TrackedOverlay overlay : overlays) {
+-                for (var entry : overlay.getWriteProvenance().long2ObjectEntrySet()) {
+-                    if (!entry.getValue().equals(tainted)) continue;
+-
+-                    long pos = entry.getLongKey();
+-
+-                    // Find operations that read this position across all overlays
+-                    for (TrackedOverlay readerOverlay : overlays) {
+-                        for (TrackedOverlay.ReadRecord record : readerOverlay.getOperationReads()) {
+-                            if (record.pos() == pos && !taintedOps.contains(record.opId())) {
+-                                taintedOps.add(record.opId());
+-                                worklist.add(record.opId());
+-                            }
++            // Find positions this tainted operation wrote to — O(1) lookup
++            it.unimi.dsi.fastutil.longs.LongOpenHashSet writtenPositions = writesByOp.get(tainted);
++            if (writtenPositions != null) {
++                for (long pos : writtenPositions) {
++                    // Find readers of this position — O(1) lookup
++                    java.util.List<OperationId> readers = readersByPos.get(pos);
++                    if (readers == null) continue;
++
++                    for (OperationId reader : readers) {
++                        if (!taintedOps.contains(reader)) {
++                            taintedOps.add(reader);
++                            worklist.add(reader);
+                         }
+                     }
+                 }
+             }
+ 
+-            // Also walk through cascade-touched positions of the tainted operation
++            // Also walk through cascade-touched positions for this operation
+             for (TrackedOverlay overlay : overlays) {
+                 for (long touchedPos : overlay.getTouchedPositions()) {
+                     if (overlay.hasWrite(touchedPos)) continue;
+ 
+                     // Check if this touched position belongs to the tainted operation
+-                    boolean belongsToTainted = false;
+-                    for (TrackedOverlay.ReadRecord record : overlay.getOperationReads()) {
+-                        if (record.pos() == touchedPos && record.opId().equals(tainted)) {
+-                            belongsToTainted = true;
+-                            break;
+-                        }
+-                    }
++                    java.util.List<OperationId> touchedReaders = readersByPos.get(touchedPos);
++                    if (touchedReaders == null) continue;
+ 
++                    boolean belongsToTainted = touchedReaders.contains(tainted);
+                     if (!belongsToTainted) continue;
+ 
+-                    // Find operations on other overlays that read this position
+-                    for (TrackedOverlay readerOverlay : overlays) {
+-                        if (readerOverlay == overlay) continue;
+-                        for (TrackedOverlay.ReadRecord record : readerOverlay.getOperationReads()) {
+-                            if (record.pos() == touchedPos && !taintedOps.contains(record.opId())) {
+-                                taintedOps.add(record.opId());
+-                                worklist.add(record.opId());
+-                            }
++                    // Taint other readers at this position
++                    for (OperationId reader : touchedReaders) {
++                        if (!reader.equals(tainted) && !taintedOps.contains(reader)) {
++                            taintedOps.add(reader);
++                            worklist.add(reader);
+                         }
+                     }
+                 }
+diff --git a/net/minecraft/server/level/mica/TickGrouper.java b/net/minecraft/server/level/mica/TickGrouper.java
+index 530ba2fcd12ab0857ec90908298954cf7d5de547..a87a45b019a6c343f8475f0f3b26fa906b099cc6 100644
+--- a/net/minecraft/server/level/mica/TickGrouper.java
++++ b/net/minecraft/server/level/mica/TickGrouper.java
+@@ -5,17 +5,22 @@
+ // After parallel scheduled tick execution, groups ticks into independent
+ // connected components based on their read/write/cascade overlap.
+ // Components with no internal conflicts keep their parallel results.
+-// Components with conflicts get re-run serially.
++// Components with conflicts are re-run — potentially in parallel with each other,
++// since independent groups share no positions by construction.
+ //
+ // Uses Union-Find (disjoint set) for efficient grouping.
++// Pre-indexes positions by OperationId for O(total_positions) grouping
++// instead of O(ticks × total_reads).
+ 
+ package net.minecraft.server.level.mica;
+ 
+ import it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap;
+ import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
+ import java.util.ArrayList;
++import java.util.HashMap;
+ import java.util.HashSet;
+ import java.util.List;
++import java.util.Map;
+ import java.util.Set;
+ 
+ public class TickGrouper {
+@@ -27,7 +32,7 @@ public class TickGrouper {
+ 
+     /**
+      * A group of tick indices that form a connected component.
+-     * If tainted, the entire group must be re-run serially.
++     * If tainted, the entire group must be re-run.
+      */
+     public record TickGroup(List<Integer> tickIndices, boolean tainted) {}
+ 
+@@ -57,7 +62,6 @@ public class TickGrouper {
+             int ra = find(a);
+             int rb = find(b);
+             if (ra == rb) return;
+-            // union by rank
+             if (rank[ra] < rank[rb]) {
+                 parent[ra] = rb;
+             } else if (rank[ra] > rank[rb]) {
+@@ -69,26 +73,45 @@ public class TickGrouper {
+         }
+     }
+ 
++    /**
++     * Pre-built index of positions per operation, built once after
++     * the parallel phase. O(total_reads + total_writes) to build.
++     */
++    public static Map<OperationId, LongOpenHashSet> buildPositionIndex(
++        List<TrackedOverlay> overlays
++    ) {
++        Map<OperationId, LongOpenHashSet> index = new HashMap<>();
++
++        for (TrackedOverlay overlay : overlays) {
++            // Index write positions by operation
++            for (var entry : overlay.getWriteProvenance().long2ObjectEntrySet()) {
++                OperationId opId = entry.getValue();
++                index.computeIfAbsent(opId, k -> new LongOpenHashSet()).add(entry.getLongKey());
++            }
++
++            // Index read positions by operation
++            for (TrackedOverlay.ReadRecord record : overlay.getOperationReads()) {
++                index.computeIfAbsent(record.opId(), k -> new LongOpenHashSet()).add(record.pos());
++            }
++        }
++
++        return index;
++    }
++
+     /**
+      * Group ticks into connected components based on position overlap.
+      *
+-     * Two ticks are in the same group if they share any position through:
+-     * - Write-write overlap (both wrote to same position)
+-     * - Write-read overlap (one wrote, other read same position)
+-     * - Touched-read overlap (one's cascade touched a position the other read)
++     * Two ticks are in the same group if they share any position through
++     * reads, writes, or cascade touches.
+      *
+-     * @param overlays    The per-thread overlays from parallel execution
+-     * @param tickCount   Total number of ticks that were dispatched
+-     * @param threadCount Number of threads used
+-     * @param batchSize   Size of each thread's batch (for mapping tick index → thread)
+-     * @param taintedOps  Set of tainted OperationIds from the merger
+-     * @param tickOpIds   Array mapping tick index → OperationId
++     * @param positionIndex  Pre-built map of OperationId → positions involved
++     * @param tickCount      Total number of ticks dispatched
++     * @param taintedOps     Set of tainted OperationIds from the merger
++     * @param tickOpIds      Array mapping tick index → OperationId
+      */
+     public static GroupResult groupTicks(
+-        List<TrackedOverlay> overlays,
++        Map<OperationId, LongOpenHashSet> positionIndex,
+         int tickCount,
+-        int threadCount,
+-        int batchSize,
+         Set<OperationId> taintedOps,
+         OperationId[] tickOpIds
+     ) {
+@@ -98,44 +121,20 @@ public class TickGrouper {
+ 
+         UnionFind uf = new UnionFind(tickCount);
+ 
+-        // Build position → tick index mapping
+-        // For each position that any tick wrote, read, or touched,
+-        // record which tick indices are involved
++        // Map each position to the first tick index that touched it.
++        // When a second tick touches the same position, union them.
+         Long2IntOpenHashMap positionToFirstTick = new Long2IntOpenHashMap();
+         positionToFirstTick.defaultReturnValue(-1);
+ 
+         for (int tickIdx = 0; tickIdx < tickCount; tickIdx++) {
+-            int threadIdx = tickIdx / batchSize;
+-            if (threadIdx >= threadCount) break;
+-
+-            TrackedOverlay overlay = overlays.get(threadIdx);
+             OperationId opId = tickOpIds[tickIdx];
+             if (opId == null) continue;
+ 
+-            // Collect all positions this tick is involved with
+-            LongOpenHashSet involvedPositions = new LongOpenHashSet();
+-
+-            // Positions this tick wrote
+-            for (var entry : overlay.getWriteProvenance().long2ObjectEntrySet()) {
+-                if (entry.getValue().equals(opId)) {
+-                    involvedPositions.add(entry.getLongKey());
+-                }
+-            }
+-
+-            // Positions this tick read
+-            for (TrackedOverlay.ReadRecord record : overlay.getOperationReads()) {
+-                if (record.opId().equals(opId)) {
+-                    involvedPositions.add(record.pos());
+-                }
+-            }
+-
+-            // Positions this tick's cascade touched
+-            // (touchedPositions are per-overlay, not per-operation,
+-            //  but during scheduled ticks each thread typically runs
+-            //  one operation at a time, so they're effectively per-operation)
++            LongOpenHashSet positions = positionIndex.get(opId);
++            if (positions == null) continue;
+ 
+             // Union this tick with any previous tick that shares a position
+-            for (long pos : involvedPositions) {
++            for (long pos : positions) {
+                 int prev = positionToFirstTick.get(pos);
+                 if (prev == -1) {
+                     positionToFirstTick.put(pos, tickIdx);
+@@ -146,7 +145,7 @@ public class TickGrouper {
+         }
+ 
+         // Extract connected components
+-        java.util.Map<Integer, List<Integer>> components = new java.util.HashMap<>();
++        Map<Integer, List<Integer>> components = new HashMap<>();
+         for (int i = 0; i < tickCount; i++) {
+             int root = uf.find(i);
+             components.computeIfAbsent(root, k -> new ArrayList<>()).add(i);
