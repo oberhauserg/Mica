@@ -1,0 +1,931 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grant Oberhauser <oberhausergrant@gmail.com>
+Date: Thu, 12 Mar 2026 23:10:11 -0700
+Subject: [PATCH] Mica: Add configs, fix water
+
+
+diff --git a/net/minecraft/server/Services.java b/net/minecraft/server/Services.java
+index db4ad03b30e1e7dc8856ce759b610402acb076e0..6226ee005a6d070cb82cca68a44ff0eaf1294ed1 100644
+--- a/net/minecraft/server/Services.java
++++ b/net/minecraft/server/Services.java
+@@ -42,9 +42,14 @@ public record Services(
+         MinecraftSessionService minecraftSessionService = authenticationService.createMinecraftSessionService();
+         GameProfileRepository gameProfileRepository = authenticationService.createProfileRepository();
+         UserNameToIdResolver userNameToIdResolver = new CachedUserNameToIdResolver(gameProfileRepository, userCacheFile); // Paper
++
+         // Paper start - load paper config files from cli options
+         final java.nio.file.Path legacyConfigPath = ((File) optionSet.valueOf("paper-settings")).toPath();
+         final java.nio.file.Path configDirPath = ((File) optionSet.valueOf("paper-settings-directory")).toPath();
++        // Mica start - load mica.yml
++        net.minecraft.server.level.mica.MicaConfig.load(configDirPath);
++        // Mica end
++
+         io.papermc.paper.configuration.PaperConfigurations paperConfigurations = io.papermc.paper.configuration.PaperConfigurations.setup(legacyConfigPath, configDirPath, profileRepository.toPath(), (File) optionSet.valueOf("spigot-settings"));
+         PaperServices paperServices = new PaperServices(
+             paperConfigurations,
+diff --git a/net/minecraft/server/level/ServerChunkCache.java b/net/minecraft/server/level/ServerChunkCache.java
+index d017d1f29e1ae32fa27c1fb78e8cd906e1747519..7ba9e8b8e155c7893b66bb7620813e93cb2a1073 100644
+--- a/net/minecraft/server/level/ServerChunkCache.java
++++ b/net/minecraft/server/level/ServerChunkCache.java
+@@ -155,10 +155,6 @@ public class ServerChunkCache extends ChunkSource implements ca.spottedleaf.moon
+         return load ? this.syncLoad(chunkX, chunkZ, toStatus) : null;
+     }
+     // Mica start - parallel random tick infrastructure
+-    public static final int MICA_THREAD_COUNT = Math.max(2, Runtime.getRuntime().availableProcessors());
+-    public static final java.util.concurrent.ForkJoinPool MICA_POOL = new java.util.concurrent.ForkJoinPool(MICA_THREAD_COUNT);
+-    public static final org.slf4j.Logger MICA_LOGGER = org.slf4j.LoggerFactory.getLogger("Mica");
+-
+     // Reusable overlay array to reduce allocation
+     private net.minecraft.server.level.mica.TrackedOverlay[] micaOverlays;
+ 
+@@ -192,10 +188,10 @@ public class ServerChunkCache extends ChunkSource implements ca.spottedleaf.moon
+ 
+         // --- Phase 2: Parallel Compute ---
+         // Initialize or reuse overlays
+-        if (this.micaOverlays == null || this.micaOverlays.length < MICA_THREAD_COUNT) {
+-            this.micaOverlays = new net.minecraft.server.level.mica.TrackedOverlay[MICA_THREAD_COUNT];
++        if (this.micaOverlays == null || this.micaOverlays.length < net.minecraft.server.level.mica.MicaConfig.get().getThreadCount()) {
++            this.micaOverlays = new net.minecraft.server.level.mica.TrackedOverlay[net.minecraft.server.level.mica.MicaConfig.get().getThreadCount()];
+         }
+-        for (int t = 0; t < MICA_THREAD_COUNT; t++) {
++        for (int t = 0; t < net.minecraft.server.level.mica.MicaConfig.get().getThreadCount(); t++) {
+             if (this.micaOverlays[t] == null) {
+                 this.micaOverlays[t] = new net.minecraft.server.level.mica.TrackedOverlay(snapshot);
+             } else {
+@@ -217,11 +213,11 @@ public class ServerChunkCache extends ChunkSource implements ca.spottedleaf.moon
+         }
+ 
+         // Dispatch to thread pool
+-        final int batchSize = Math.max(1, (size + MICA_THREAD_COUNT - 1) / MICA_THREAD_COUNT);
+-        final java.util.concurrent.CountDownLatch latch = new java.util.concurrent.CountDownLatch(MICA_THREAD_COUNT);
++        final int batchSize = Math.max(1, (size + net.minecraft.server.level.mica.MicaConfig.get().getThreadCount() - 1) / net.minecraft.server.level.mica.MicaConfig.get().getThreadCount());
++        final java.util.concurrent.CountDownLatch latch = new java.util.concurrent.CountDownLatch(net.minecraft.server.level.mica.MicaConfig.get().getThreadCount());
+         final java.util.concurrent.atomic.AtomicReference<Throwable> error = new java.util.concurrent.atomic.AtomicReference<>();
+ 
+-        for (int t = 0; t < MICA_THREAD_COUNT; t++) {
++        for (int t = 0; t < net.minecraft.server.level.mica.MicaConfig.get().getThreadCount(); t++) {
+             final int threadIndex = t;
+             final int start = t * batchSize;
+             final int end = Math.min(start + batchSize, size);
+@@ -233,7 +229,7 @@ public class ServerChunkCache extends ChunkSource implements ca.spottedleaf.moon
+ 
+             final net.minecraft.server.level.mica.TrackedOverlay overlay = this.micaOverlays[t];
+ 
+-            MICA_POOL.execute(() -> {
++            net.minecraft.server.level.mica.MicaConfig.get().getPool().execute(() -> {
+                 try {
+                     ca.spottedleaf.moonrise.common.util.TickThread.micaParallelPhase.set(Boolean.TRUE);
+                     world.micaOverlay.set(overlay);
+@@ -257,7 +253,7 @@ public class ServerChunkCache extends ChunkSource implements ca.spottedleaf.moon
+                     }
+                 } catch (Throwable t1) {
+                     error.compareAndSet(null, t1);
+-                    MICA_LOGGER.error("[Mica] Error in parallel chunk tick on thread {}", threadIndex, t1);
++                    net.minecraft.server.level.mica.MicaConfig.getLogger().error("Error in parallel chunk tick on thread {}", threadIndex, t1);
+                 } finally {
+                     ca.spottedleaf.moonrise.common.util.TickThread.micaParallelPhase.set(Boolean.FALSE);
+                     world.micaOverlay.remove();
+@@ -279,13 +275,13 @@ public class ServerChunkCache extends ChunkSource implements ca.spottedleaf.moon
+ 
+         // Check for errors
+         if (error.get() != null) {
+-            MICA_LOGGER.error("[Mica] Parallel tick failed, skipping merge/apply");
++            net.minecraft.server.level.mica.MicaConfig.getLogger().error("Parallel tick failed, skipping merge/apply");
+             return;
+         }
+ 
+         // --- Phase 3: Merge ---
+         java.util.List<net.minecraft.server.level.mica.TrackedOverlay> activeOverlays =
+-            java.util.Arrays.asList(this.micaOverlays).subList(0, MICA_THREAD_COUNT);
++            java.util.Arrays.asList(this.micaOverlays).subList(0, net.minecraft.server.level.mica.MicaConfig.get().getThreadCount());
+ 
+         net.minecraft.server.level.mica.OverlayMerger.MergeResult mergeResult =
+             net.minecraft.server.level.mica.OverlayMerger.merge(activeOverlays);
+@@ -311,7 +307,7 @@ public class ServerChunkCache extends ChunkSource implements ca.spottedleaf.moon
+             java.util.List<net.minecraft.server.level.mica.TrackedOverlay.TickRecord> toRerun =
+                 new java.util.ArrayList<>();
+ 
+-            for (int t = 0; t < MICA_THREAD_COUNT; t++) {
++            for (int t = 0; t < net.minecraft.server.level.mica.MicaConfig.get().getThreadCount(); t++) {
+                 for (net.minecraft.server.level.mica.TrackedOverlay.TickRecord record :
+                     this.micaOverlays[t].getTickRecords()) {
+                     if (mergeResult.taintedOperations().contains(record.opId())) {
+@@ -363,7 +359,7 @@ public class ServerChunkCache extends ChunkSource implements ca.spottedleaf.moon
+         }
+ 
+         // Apply deferred effects from parallel phase on main thread
+-        for (int t = 0; t < MICA_THREAD_COUNT; t++) {
++        for (int t = 0; t < net.minecraft.server.level.mica.MicaConfig.get().getThreadCount(); t++) {
+             net.minecraft.server.level.mica.DeferredEffects deferred = this.micaOverlays[t].deferredEffects;
+             if (deferred != null && !deferred.isEmpty()) {
+                 deferred.apply(world);
+@@ -373,7 +369,7 @@ public class ServerChunkCache extends ChunkSource implements ca.spottedleaf.moon
+         long timeApply = System.nanoTime();
+ 
+         // --- Stats ---
+-        for (int t = 0; t < MICA_THREAD_COUNT; t++) {
++        for (int t = 0; t < net.minecraft.server.level.mica.MicaConfig.get().getThreadCount(); t++) {
+             micaCumulativeReads += this.micaOverlays[t].getReadCount();
+             micaCumulativeWrites += this.micaOverlays[t].getWriteCount();
+         }
+@@ -384,7 +380,7 @@ public class ServerChunkCache extends ChunkSource implements ca.spottedleaf.moon
+         world.micaTickCount++;
+         if (world.micaTickCount % 200 == 0) {
+             int totalReads = 0, totalWrites = 0, totalDeferred = 0;
+-            for (int t = 0; t < MICA_THREAD_COUNT; t++) {
++            for (int t = 0; t < net.minecraft.server.level.mica.MicaConfig.get().getThreadCount(); t++) {
+                 totalReads += this.micaOverlays[t].getReadCount();
+                 totalWrites += this.micaOverlays[t].getWriteCount();
+                 if (this.micaOverlays[t].deferredEffects != null) {
+@@ -400,10 +396,10 @@ public class ServerChunkCache extends ChunkSource implements ca.spottedleaf.moon
+             double msApply = (timeApply - timeConverge) / 1_000_000.0;
+             double msTotal = (timeApply - timeStart) / 1_000_000.0;
+ 
+-            MICA_LOGGER.info("{} threads | {} chunks | {} reads, {} writes | {} conflicts, {} tainted, {} re-runs",
+-                MICA_THREAD_COUNT, size, micaCumulativeReads, micaCumulativeWrites,
++            net.minecraft.server.level.mica.MicaConfig.getLogger().info("{} threads | {} chunks | {} reads, {} writes | {} conflicts, {} tainted, {} re-runs",
++                net.minecraft.server.level.mica.MicaConfig.get().getThreadCount(), size, micaCumulativeReads, micaCumulativeWrites,
+                 micaCumulativeConflicts, micaCumulativeTainted, micaCumulativeReruns);
+-            MICA_LOGGER.info("Timing: {}ms total | snapshot {}ms | compute {}ms | merge {}ms | converge {}ms | apply {}ms",
++            net.minecraft.server.level.mica.MicaConfig.getLogger().info("Timing: {}ms total | snapshot {}ms | compute {}ms | merge {}ms | converge {}ms | apply {}ms",
+                 String.format("%.2f", msTotal),
+                 String.format("%.2f", msSnapshot),
+                 String.format("%.2f", msCompute),
+diff --git a/net/minecraft/server/level/ServerLevel.java b/net/minecraft/server/level/ServerLevel.java
+index 563e63b8e17eb4817a27f97429e87fffe628555d..2ae979c85ab458c625d56a2d3d2c7d29ccf9e75f 100644
+--- a/net/minecraft/server/level/ServerLevel.java
++++ b/net/minecraft/server/level/ServerLevel.java
+@@ -775,7 +775,7 @@ public class ServerLevel extends Level implements ServerEntityGetter, WorldGenLe
+     public long micaScheduledTickCumConf = 0;
+ 
+     private <T> void micaRunScheduledTicks(java.util.List<net.minecraft.world.ticks.ScheduledTick<T>> ticks, boolean isBlockTick) {
+-        final int threadCount = ServerChunkCache.MICA_THREAD_COUNT;
++        final int threadCount = net.minecraft.server.level.mica.MicaConfig.get().getThreadCount();
+         final net.minecraft.server.level.mica.WorldSnapshot snapshot = net.minecraft.server.level.mica.WorldSnapshot.capture(this);
+ 
+         final net.minecraft.server.level.mica.TrackedOverlay[] overlays =
+@@ -806,7 +806,7 @@ public class ServerLevel extends Level implements ServerEntityGetter, WorldGenLe
+ 
+             final net.minecraft.server.level.mica.TrackedOverlay overlay = overlays[t];
+ 
+-            ServerChunkCache.MICA_POOL.execute(() -> {
++            net.minecraft.server.level.mica.MicaConfig.get().getPool().execute(() -> {
+                 try {
+                     ca.spottedleaf.moonrise.common.util.TickThread.micaParallelPhase.set(Boolean.TRUE);
+                     this.micaOverlay.set(overlay);
+@@ -854,7 +854,7 @@ public class ServerLevel extends Level implements ServerEntityGetter, WorldGenLe
+                     }
+                 } catch (Throwable t1) {
+                     error.compareAndSet(null, t1);
+-                    ServerChunkCache.MICA_LOGGER.error("[Mica] Error in parallel scheduled tick on thread {}", threadIndex, t1);
++                    net.minecraft.server.level.mica.MicaConfig.getLogger().error("Error in parallel scheduled tick on thread {}", threadIndex, t1);
+                 } finally {
+                     latch.countDown();
+                 }
+@@ -868,7 +868,7 @@ public class ServerLevel extends Level implements ServerEntityGetter, WorldGenLe
+         }
+ 
+         if (error.get() != null) {
+-            ServerChunkCache.MICA_LOGGER.error("[Mica] Scheduled tick had errors");
++            net.minecraft.server.level.mica.MicaConfig.getLogger().error("Scheduled tick had errors");
+             return;
+         }
+ 
+@@ -892,9 +892,13 @@ public class ServerLevel extends Level implements ServerEntityGetter, WorldGenLe
+             }
+ 
+             // Replay all deferred scheduled ticks
++            int totalDeferredTicks = 0;
++            int fluidDeferredTicks = 0;
+             for (int t = 0; t < threadCount; t++) {
+                 if (overlays[t].deferredEffects != null) {
+                     for (var st : overlays[t].deferredEffects.getScheduledTicks()) {
++                        totalDeferredTicks++;
++                        if (!st.isBlock()) fluidDeferredTicks++;
+                         if (st.isBlock()) {
+                             this.getBlockTicks().schedule((net.minecraft.world.ticks.ScheduledTick) st.tick());
+                         } else {
+@@ -952,6 +956,7 @@ public class ServerLevel extends Level implements ServerEntityGetter, WorldGenLe
+             if (taintedGroups.size() == 1) {
+                 // Single tainted group — run serially on main thread, no overhead
+                 var group = taintedGroups.get(0);
++
+                 for (int tickIdx : group.tickIndices()) {
+                     var tick = ticks.get(tickIdx);
+ 
+@@ -960,8 +965,11 @@ public class ServerLevel extends Level implements ServerEntityGetter, WorldGenLe
+                         ((net.minecraft.world.ticks.LevelTicks<net.minecraft.world.level.block.Block>) this.getBlockTicks())
+                             .markTickExecuted((net.minecraft.world.ticks.ScheduledTick<net.minecraft.world.level.block.Block>) tick);
+                     } else {
+-                        ((net.minecraft.world.ticks.LevelTicks<net.minecraft.world.level.material.Fluid>) this.getFluidTicks())
+-                            .markTickExecuted((net.minecraft.world.ticks.ScheduledTick<net.minecraft.world.level.material.Fluid>) tick);
++                        net.minecraft.world.level.block.state.BlockState blockState = this.getBlockState(tick.pos());
++                        net.minecraft.world.level.material.FluidState fluidState = blockState.getFluidState();
++                        if (fluidState.is((net.minecraft.world.level.material.Fluid) tick.type())) {
++                            fluidState.tick(this, tick.pos(), blockState);
++                        }
+                     }
+ 
+                     if (isBlockTick) {
+@@ -1020,7 +1028,7 @@ public class ServerLevel extends Level implements ServerEntityGetter, WorldGenLe
+                     final var group = taintedGroups.get(g);
+                     final net.minecraft.server.level.mica.TrackedOverlay groupOverlay = groupOverlays[g];
+ 
+-                    ServerChunkCache.MICA_POOL.execute(() -> {
++                    net.minecraft.server.level.mica.MicaConfig.get().getPool().execute(() -> {
+                         try {
+                             ca.spottedleaf.moonrise.common.util.TickThread.micaParallelPhase.set(Boolean.TRUE);
+                             this.micaOverlay.set(groupOverlay);
+@@ -1072,8 +1080,8 @@ public class ServerLevel extends Level implements ServerEntityGetter, WorldGenLe
+ 
+                         } catch (Throwable t1) {
+                             groupError.compareAndSet(null, t1);
+-                            ServerChunkCache.MICA_LOGGER.error(
+-                                "[Mica] Error in tainted group {} re-run", groupIndex, t1);
++                            net.minecraft.server.level.mica.MicaConfig.getLogger().error(
++                                "Error in tainted group {} re-run", groupIndex, t1);
+                         } finally {
+                             groupLatch.countDown();
+                         }
+@@ -1087,7 +1095,7 @@ public class ServerLevel extends Level implements ServerEntityGetter, WorldGenLe
+                 }
+ 
+                 if (groupError.get() != null) {
+-                    ServerChunkCache.MICA_LOGGER.error("[Mica] Tainted group re-run had errors, falling back to serial");
++                    net.minecraft.server.level.mica.MicaConfig.getLogger().error("Tainted group re-run had errors, falling back to serial");
+                     // Fallback: re-run ALL tainted ticks serially on main thread
+                     for (var group : taintedGroups) {
+                         for (int tickIdx : group.tickIndices()) {
+@@ -1184,7 +1192,7 @@ public class ServerLevel extends Level implements ServerEntityGetter, WorldGenLe
+             }
+ 
+             // Log grouping stats
+-            ServerChunkCache.MICA_LOGGER.info(
++            net.minecraft.server.level.mica.MicaConfig.getLogger().info(
+                 "[Mica/Scheduled] {} groups ({} clean, {} tainted) from {} ticks",
+                 groupResult.groups().size(), cleanGroups.size(), taintedGroups.size(), ticks.size());
+         }
+@@ -1233,7 +1241,7 @@ public class ServerLevel extends Level implements ServerEntityGetter, WorldGenLe
+             }
+         }
+ 
+-        // ServerChunkCache.MICA_LOGGER.info("[Mica/Scheduled] {} groups ({} clean, {} tainted) from {} ticks",
++        // net.minecraft.server.level.mica.MicaConfig.getLogger().info("[Mica/Scheduled] {} groups ({} clean, {} tainted) from {} ticks",
+         //     groupResult.groups().size(), cleanGroups, taintedGroups, ticks.size());
+ 
+         micaScheduledTickCumTaint += mergeResult.taintedOperationCount();
+@@ -1246,7 +1254,7 @@ public class ServerLevel extends Level implements ServerEntityGetter, WorldGenLe
+                 totalReads += overlays[t].getReadCount();
+                 totalWrites += overlays[t].getWriteCount();
+             }
+-            // ServerChunkCache.MICA_LOGGER.info("[Mica/Scheduled] {} | {} threads | {} ticks | {} reads, {} writes | {} conflicts, {} tainted",
++            // net.minecraft.server.level.mica.MicaConfig.getLogger().info("[Mica/Scheduled] {} | {} threads | {} ticks | {} reads, {} writes | {} conflicts, {} tainted",
+             //     isBlockTick ? "blocks" : "fluids",
+             //     threadCount, ticks.size(), totalReads, totalWrites,
+             //     micaScheduledTickCumConf, micaScheduledTickCumTaint);
+@@ -1307,32 +1315,39 @@ public class ServerLevel extends Level implements ServerEntityGetter, WorldGenLe
+         if (!this.isDebug() && runsNormally) {
+             long l = this.getGameTime();
+ 
+-            // profilerFiller.push("blockTicks");
+-            // this.blockTicks.tick(l, paperConfig().environment.maxBlockTicks, this::tickBlock);
+-            // profilerFiller.popPush("fluidTicks");
+-            // this.fluidTicks.tick(l, paperConfig().environment.maxFluidTicks, this::tickFluid);
+-            // profilerFiller.pop();
+-
+             // Mica start - parallel scheduled ticks
+             profilerFiller.push("blockTicks");
+-            java.util.List<net.minecraft.world.ticks.ScheduledTick<net.minecraft.world.level.block.Block>> blockTickList =
+-                this.blockTicks.collectForParallelDispatch(l, paperConfig().environment.maxBlockTicks);
++            if(net.minecraft.server.level.mica.MicaConfig.get().enabled && net.minecraft.server.level.mica.MicaConfig.get().parallelScheduledBlockTicks)
++            {
++                java.util.List<net.minecraft.world.ticks.ScheduledTick<net.minecraft.world.level.block.Block>> blockTickList =
++                    this.blockTicks.collectForParallelDispatch(l, paperConfig().environment.maxBlockTicks);
+ 
+-            if (!blockTickList.isEmpty()) {
+-                this.micaRunScheduledTicks(blockTickList, true);
++                if (!blockTickList.isEmpty()) {
++                    this.micaRunScheduledTicks(blockTickList, true);
++                }
++                this.blockTicks.finishParallelDispatch();
++            }
++            else
++            {
++                this.blockTicks.tick(l, paperConfig().environment.maxBlockTicks, this::tickBlock);
+             }
+-            this.blockTicks.finishParallelDispatch();
+ 
+             profilerFiller.popPush("fluidTicks");
+-            java.util.List<net.minecraft.world.ticks.ScheduledTick<net.minecraft.world.level.material.Fluid>> fluidTickList =
+-                this.fluidTicks.collectForParallelDispatch(l, paperConfig().environment.maxFluidTicks);
++            if(net.minecraft.server.level.mica.MicaConfig.get().enabled && net.minecraft.server.level.mica.MicaConfig.get().parallelScheduledFluidTicks) {
++                java.util.List<net.minecraft.world.ticks.ScheduledTick<net.minecraft.world.level.material.Fluid>> fluidTickList =
++                    this.fluidTicks.collectForParallelDispatch(l, paperConfig().environment.maxFluidTicks);
+ 
+-            if (!fluidTickList.isEmpty()) {
+-                this.micaRunScheduledTicks(fluidTickList, false);
++                if (!fluidTickList.isEmpty()) {
++                    this.micaRunScheduledTicks(fluidTickList, false);
++                }
++                this.fluidTicks.finishParallelDispatch();
++            }
++            else
++            {
++                this.fluidTicks.tick(l, paperConfig().environment.maxFluidTicks, this::tickFluid);
+             }
+-            this.fluidTicks.finishParallelDispatch();
+-            profilerFiller.pop();
+             // Mica end
++            profilerFiller.pop();
+         }
+ 
+         profilerFiller.popPush("raid");
+@@ -1371,162 +1386,175 @@ public class ServerLevel extends Level implements ServerEntityGetter, WorldGenLe
+             // Mica start - parallel entity ticking
+             final TickRateManager micaTickRateManager = tickRateManager;
+ 
+-            // Collect entities to tick into a list for partitioning
+             final java.util.List<Entity> entitiesToTick = new java.util.ArrayList<>();
++
++            // Collect entities to tick into a list for partitioning
+             this.entityTickList.forEach(entity -> {
+                 if (!entity.isRemoved() && !micaTickRateManager.isEntityFrozen(entity)) {
+                     entitiesToTick.add(entity);
+                 }
+             });
+ 
+-            if (!entitiesToTick.isEmpty()) {
++            if (net.minecraft.server.level.mica.MicaConfig.get().enabled
++                && net.minecraft.server.level.mica.MicaConfig.get().parallelEntityTicks) {
+ 
+-                long entityTimeStart = System.nanoTime();
+-                final net.minecraft.server.level.mica.WorldSnapshot entitySnapshot =
+-                    net.minecraft.server.level.mica.WorldSnapshot.capture(this);
++                if (!entitiesToTick.isEmpty()) {
+ 
+-                final int threadCount = net.minecraft.server.level.ServerChunkCache.MICA_THREAD_COUNT;
+-                final net.minecraft.server.level.mica.TrackedOverlay[] entityOverlays =
+-                    new net.minecraft.server.level.mica.TrackedOverlay[threadCount];
++                    long entityTimeStart = System.nanoTime();
++                    final net.minecraft.server.level.mica.WorldSnapshot entitySnapshot =
++                        net.minecraft.server.level.mica.WorldSnapshot.capture(this);
+ 
+-                for (int t = 0; t < threadCount; t++) {
+-                    entityOverlays[t] = new net.minecraft.server.level.mica.TrackedOverlay(entitySnapshot);
+-                    entityOverlays[t].deferredEffects = new net.minecraft.server.level.mica.DeferredEffects();
+-                    entityOverlays[t].setThreadIndex(t);
+-                }
++                    final int threadCount = net.minecraft.server.level.mica.MicaConfig.get().getThreadCount();
++                    final net.minecraft.server.level.mica.TrackedOverlay[] entityOverlays =
++                        new net.minecraft.server.level.mica.TrackedOverlay[threadCount];
+ 
+-                final int batchSize = Math.max(1, (entitiesToTick.size() + threadCount - 1) / threadCount);
+-                final java.util.concurrent.CountDownLatch entityLatch =
+-                    new java.util.concurrent.CountDownLatch(threadCount);
+-                final java.util.concurrent.atomic.AtomicReference<Throwable> entityError =
+-                    new java.util.concurrent.atomic.AtomicReference<>();
+-
+-                // Mica - capture entity position snapshots before parallel dispatch
+-                for (Entity entity : entitiesToTick) {
+-                    entity.micaCaptureSnapshot();
+-                }
++                    for (int t = 0; t < threadCount; t++) {
++                        entityOverlays[t] = new net.minecraft.server.level.mica.TrackedOverlay(entitySnapshot);
++                        entityOverlays[t].deferredEffects = new net.minecraft.server.level.mica.DeferredEffects();
++                        entityOverlays[t].setThreadIndex(t);
++                    }
+ 
+-                for (int t = 0; t < threadCount; t++) {
+-                    final int threadIndex = t;
+-                    final int start = t * batchSize;
+-                    final int end = Math.min(start + batchSize, entitiesToTick.size());
++                    final int batchSize = Math.max(1, (entitiesToTick.size() + threadCount - 1) / threadCount);
++                    final java.util.concurrent.CountDownLatch entityLatch =
++                        new java.util.concurrent.CountDownLatch(threadCount);
++                    final java.util.concurrent.atomic.AtomicReference<Throwable> entityError =
++                        new java.util.concurrent.atomic.AtomicReference<>();
+ 
+-                    if (start >= entitiesToTick.size()) {
+-                        entityLatch.countDown();
+-                        continue;
++                    // Mica - capture entity position snapshots before parallel dispatch
++                    for (Entity entity : entitiesToTick) {
++                        entity.micaCaptureSnapshot();
+                     }
+ 
+-                    final net.minecraft.server.level.mica.TrackedOverlay overlay = entityOverlays[t];
++                    for (int t = 0; t < threadCount; t++) {
++                        final int threadIndex = t;
++                        final int start = t * batchSize;
++                        final int end = Math.min(start + batchSize, entitiesToTick.size());
+ 
+-                    net.minecraft.server.level.ServerChunkCache.MICA_POOL.execute(() -> {
+-                        try {
+-                            ca.spottedleaf.moonrise.common.util.TickThread.micaParallelPhase.set(Boolean.TRUE);
+-                            this.micaOverlay.set(overlay);
+-                            net.minecraft.world.level.Level.micaDeferredStatic.set(overlay.deferredEffects);
++                        if (start >= entitiesToTick.size()) {
++                            entityLatch.countDown();
++                            continue;
++                        }
+ 
+-                            alternate.current.wire.WireHandler threadWireHandler = new alternate.current.wire.WireHandler(this);
+-                            Level.micaWireHandler.set(threadWireHandler);
++                        final net.minecraft.server.level.mica.TrackedOverlay overlay = entityOverlays[t];
+ 
++                        net.minecraft.server.level.mica.MicaConfig.get().getPool().execute(() -> {
+                             try {
+-                                for (int curEntitiy = start; curEntitiy < end; curEntitiy++) {
+-                                    Entity entity = entitiesToTick.get(curEntitiy);
+-                                    if (entity.isRemoved()) continue;
+-
+-                                    net.minecraft.server.level.mica.OperationId opId =
+-                                        net.minecraft.server.level.mica.OperationId.entityTick(
+-                                            entity.getId(), threadIndex);
+-                                    overlay.setCurrentOperation(opId);
+-                                    overlay.deferredEffects.setCurrentOperation(opId);
+-
+-                                    // Vehicle checks
+-                                    Entity vehicle = entity.getVehicle();
+-                                    if (vehicle != null) {
+-                                        if (!vehicle.isRemoved() && vehicle.hasPassenger(entity)) {
+-                                            continue;
++                                ca.spottedleaf.moonrise.common.util.TickThread.micaParallelPhase.set(Boolean.TRUE);
++                                this.micaOverlay.set(overlay);
++                                net.minecraft.world.level.Level.micaDeferredStatic.set(overlay.deferredEffects);
++
++                                alternate.current.wire.WireHandler threadWireHandler = new alternate.current.wire.WireHandler(this);
++                                Level.micaWireHandler.set(threadWireHandler);
++
++                                try {
++                                    for (int curEntitiy = start; curEntitiy < end; curEntitiy++) {
++                                        Entity entity = entitiesToTick.get(curEntitiy);
++                                        if (entity.isRemoved()) continue;
++
++                                        net.minecraft.server.level.mica.OperationId opId =
++                                            net.minecraft.server.level.mica.OperationId.entityTick(
++                                                entity.getId(), threadIndex);
++                                        overlay.setCurrentOperation(opId);
++                                        overlay.deferredEffects.setCurrentOperation(opId);
++
++                                        // Vehicle checks
++                                        Entity vehicle = entity.getVehicle();
++                                        if (vehicle != null) {
++                                            if (!vehicle.isRemoved() && vehicle.hasPassenger(entity)) {
++                                                continue;
++                                            }
++                                            entity.stopRiding();
+                                         }
+-                                        entity.stopRiding();
+-                                    }
+ 
+-                                    // Tick the entity
+-                                    try {
+-                                        this.tickNonPassenger(entity);
+-                                    } catch (Throwable t1) {
+-                                        // Match guardEntityTick behavior — log and discard
+-                                        String msg = String.format("Entity threw exception at %s:%s,%s,%s",
+-                                            this.getWorld().getName(), entity.getX(), entity.getY(), entity.getZ());
+-                                        net.minecraft.server.MinecraftServer.LOGGER.error(msg, t1);
+-                                        entity.discard(org.bukkit.event.entity.EntityRemoveEvent.Cause.DISCARD);
++                                        // Tick the entity
++                                        try {
++                                            this.tickNonPassenger(entity);
++                                        } catch (Throwable t1) {
++                                            // Match guardEntityTick behavior — log and discard
++                                            String msg = String.format("Entity threw exception at %s:%s,%s,%s",
++                                                this.getWorld().getName(), entity.getX(), entity.getY(), entity.getZ());
++                                            net.minecraft.server.MinecraftServer.LOGGER.error(msg, t1);
++                                            entity.discard(org.bukkit.event.entity.EntityRemoveEvent.Cause.DISCARD);
++                                        }
+                                     }
++                                } finally {
++                                    ca.spottedleaf.moonrise.common.util.TickThread.micaParallelPhase.set(Boolean.FALSE);
++                                    this.micaOverlay.remove();
++                                    Level.micaWireHandler.remove();
++                                    net.minecraft.world.level.Level.micaDeferredStatic.remove();
+                                 }
++                            } catch (Throwable t1) {
++                                entityError.compareAndSet(null, t1);
++                                net.minecraft.server.level.mica.MicaConfig.getLogger().error(
++                                    "Error in parallel entity tick on thread {}", threadIndex, t1);
+                             } finally {
+-                                ca.spottedleaf.moonrise.common.util.TickThread.micaParallelPhase.set(Boolean.FALSE);
+-                                this.micaOverlay.remove();
+-                                Level.micaWireHandler.remove();
+-                                net.minecraft.world.level.Level.micaDeferredStatic.remove();
++                                entityLatch.countDown();
+                             }
+-                        } catch (Throwable t1) {
+-                            entityError.compareAndSet(null, t1);
+-                            net.minecraft.server.level.ServerChunkCache.MICA_LOGGER.error(
+-                                "[Mica] Error in parallel entity tick on thread {}", threadIndex, t1);
+-                        } finally {
+-                            entityLatch.countDown();
+-                        }
+-                    });
+-                }
+-
+-                try {
+-                    entityLatch.await();
+-                } catch (InterruptedException e) {
+-                    Thread.currentThread().interrupt();
+-                }
++                        });
++                    }
+ 
+-                // Mica - clear entity snapshots
+-                for (Entity entity : entitiesToTick) {
+-                    entity.micaClearSnapshot();
+-                }
++                    try {
++                        entityLatch.await();
++                    } catch (InterruptedException e) {
++                        Thread.currentThread().interrupt();
++                    }
+ 
+-                // Apply block state writes from entity overlays
+-                for (int t = 0; t < threadCount; t++) {
+-                    for (var entry : entityOverlays[t].getBlockWrites().long2ObjectEntrySet()) {
+-                        net.minecraft.core.BlockPos pos = net.minecraft.core.BlockPos.of(entry.getLongKey());
+-                        this.micaRawSetBlock(pos, entry.getValue());
++                    // Mica - clear entity snapshots
++                    for (Entity entity : entitiesToTick) {
++                        entity.micaClearSnapshot();
+                     }
+-                }
+ 
+-                // Apply deferred effects on main thread
+-                for (int t = 0; t < threadCount; t++) {
+-                    net.minecraft.server.level.mica.DeferredEffects deferred = entityOverlays[t].deferredEffects;
+-                    if (deferred != null && !deferred.isEmpty()) {
+-                        deferred.apply(this);
++                    // Apply block state writes from entity overlays
++                    for (int t = 0; t < threadCount; t++) {
++                        for (var entry : entityOverlays[t].getBlockWrites().long2ObjectEntrySet()) {
++                            net.minecraft.core.BlockPos pos = net.minecraft.core.BlockPos.of(entry.getLongKey());
++                            this.micaRawSetBlock(pos, entry.getValue());
++                        }
+                     }
+-                }
+ 
+-                // Mica - entity tick stats
+-                long entityTimeEnd = System.nanoTime();
+-                this.micaEntityTickCount++;
+-                if (this.micaEntityTickCount % 200 == 0) {
+-                    int totalReads = 0, totalWrites = 0, totalDeferred = 0;
++                    // Apply deferred effects on main thread
+                     for (int t = 0; t < threadCount; t++) {
+-                        totalReads += entityOverlays[t].getReadCount();
+-                        totalWrites += entityOverlays[t].getWriteCount();
+-                        if (entityOverlays[t].deferredEffects != null) {
+-                            totalDeferred += entityOverlays[t].deferredEffects.getSkippedEntitySpawnCount()
+-                                + entityOverlays[t].deferredEffects.getSkippedEventCount();
++                        net.minecraft.server.level.mica.DeferredEffects deferred = entityOverlays[t].deferredEffects;
++                        if (deferred != null && !deferred.isEmpty()) {
++                            deferred.apply(this);
+                         }
+                     }
+-                    double msEntity = (entityTimeEnd - entityTimeStart) / 1_000_000.0;
+-                    ServerChunkCache.MICA_LOGGER.info(
+-                        "[Entities] {}ms | {} threads | {} entities | {} reads, {} writes, {} deferred",
+-                        String.format("%.2f", msEntity),
+-                        threadCount, entitiesToTick.size(), totalReads, totalWrites, totalDeferred);
+-                }
+ 
+-                if (entityError.get() != null) {
+-                    net.minecraft.server.level.ServerChunkCache.MICA_LOGGER.error(
+-                        "[Mica] Entity tick had errors, some entities may not have ticked");
++                    // Mica - entity tick stats
++                    long entityTimeEnd = System.nanoTime();
++                    this.micaEntityTickCount++;
++                    if (this.micaEntityTickCount % 200 == 0) {
++                        int totalReads = 0, totalWrites = 0, totalDeferred = 0;
++                        for (int t = 0; t < threadCount; t++) {
++                            totalReads += entityOverlays[t].getReadCount();
++                            totalWrites += entityOverlays[t].getWriteCount();
++                            if (entityOverlays[t].deferredEffects != null) {
++                                totalDeferred += entityOverlays[t].deferredEffects.getSkippedEntitySpawnCount()
++                                    + entityOverlays[t].deferredEffects.getSkippedEventCount();
++                            }
++                        }
++                        double msEntity = (entityTimeEnd - entityTimeStart) / 1_000_000.0;
++                        net.minecraft.server.level.mica.MicaConfig.getLogger().info(
++                            "[Entities] {}ms | {} threads | {} entities | {} reads, {} writes, {} deferred",
++                            String.format("%.2f", msEntity),
++                            threadCount, entitiesToTick.size(), totalReads, totalWrites, totalDeferred);
++                    }
++
++                    if (entityError.get() != null) {
++                        net.minecraft.server.level.mica.MicaConfig.getLogger().error(
++                            "Entity tick had errors, some entities may not have ticked");
++                    }
++                }
++                // Mica end - parallel entity ticking
++            }
++            else {
++                for (Entity entity : entitiesToTick) {
++                    if (!entity.isRemoved()) {
++                        guardEntityTick(this::tickNonPassenger, entity);
++                    }
+                 }
+             }
+-            // Mica end - parallel entity ticking
++
+             profilerFiller.popPush("blockEntities");
+             this.tickBlockEntities();
+             profilerFiller.pop();
+diff --git a/net/minecraft/server/level/mica/MicaConfig.java b/net/minecraft/server/level/mica/MicaConfig.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..1dc247f3345aad7fae3727d8471558d60ffc408f
+--- /dev/null
++++ b/net/minecraft/server/level/mica/MicaConfig.java
+@@ -0,0 +1,252 @@
++package net.minecraft.server.level.mica;
++
++import com.mojang.logging.LogUtils;
++import org.slf4j.Logger;
++
++import java.io.IOException;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.util.LinkedHashMap;
++import java.util.Map;
++
++/**
++ * Configuration for Mica parallel tick processing.
++ * Loaded from mica.yml in the server root directory.
++ */
++public final class MicaConfig {
++    private static final Logger LOGGER = org.slf4j.LoggerFactory.getLogger("Mica");
++    private static MicaConfig INSTANCE;
++
++    // === Config values ===
++    public boolean enabled = true;
++    public int threadCount = -1; // -1 = auto
++    public boolean parallelRandomTicks = true;
++    public boolean parallelEntityTicks = true;
++    public boolean parallelScheduledBlockTicks = true;
++    public boolean parallelScheduledFluidTicks = true;
++    public LogLevel logLevel = LogLevel.INFO;
++    public int statsInterval = 200;
++
++    private java.util.concurrent.ForkJoinPool pool;
++    private org.slf4j.Logger logger;
++
++    public enum LogLevel {
++        OFF, INFO, DEBUG, TRACE;
++
++        public boolean isAtLeast(LogLevel level) {
++            return this.ordinal() >= level.ordinal();
++        }
++    }
++
++    private MicaConfig() {}
++
++    /**
++     * Get the global Mica config instance.
++     */
++    public static MicaConfig get() {
++        if (INSTANCE == null) {
++            INSTANCE = new MicaConfig();
++        }
++        return INSTANCE;
++    }
++
++    public java.util.concurrent.ForkJoinPool getPool() {
++        if (this.pool == null) {
++            this.pool = new java.util.concurrent.ForkJoinPool(getThreadCount());
++        }
++        return this.pool;
++    }
++
++    public static org.slf4j.Logger getLogger() {
++        return LOGGER;
++    }
++
++    public boolean shouldLog(LogLevel level) {
++        return this.enabled && this.logLevel.isAtLeast(level);
++    }
++
++    /**
++     * Get the resolved thread count.
++     */
++    public int getThreadCount() {
++        if (this.threadCount <= 0) {
++            return Math.max(2, Runtime.getRuntime().availableProcessors() - 2);
++        }
++        return this.threadCount;
++    }
++
++    /**
++     * Configure the mica logger level.
++     */
++    public static void configureLogLevel() {
++        org.apache.logging.log4j.core.config.Configurator.setLevel("Mica",
++            switch (get().logLevel) {
++                case OFF -> org.apache.logging.log4j.Level.OFF;
++                case INFO -> org.apache.logging.log4j.Level.INFO;
++                case DEBUG -> org.apache.logging.log4j.Level.DEBUG;
++                case TRACE -> org.apache.logging.log4j.Level.TRACE;
++            }
++        );
++    }
++
++    /**
++     * Load config from mica.yml, creating it with defaults if it doesn't exist.
++     */
++    public static MicaConfig load(Path serverDir) {
++        MicaConfig config = new MicaConfig();
++        Path configPath = serverDir.resolve("mica.yml");
++
++        if (Files.exists(configPath)) {
++            try {
++                config.readFrom(configPath);
++            } catch (Exception e) {
++                LOGGER.error("Failed to load mica.yml, using defaults", e);
++            }
++        }
++
++        // Always write back - fills in missing keys with defaults
++        try {
++            config.writeTo(configPath);
++        } catch (Exception e) {
++            LOGGER.error("Failed to save mica.yml", e);
++        }
++
++        INSTANCE = config;
++
++        configureLogLevel();
++
++        LOGGER.info("Configuration loaded: enabled={}, threads={} (resolved={}), log-level={}",
++            config.enabled,
++            config.threadCount <= 0 ? "auto" : config.threadCount,
++            config.getThreadCount(),
++            config.logLevel);
++
++        if (config.enabled) {
++            StringBuilder subsystems = new StringBuilder("Parallel subsystems:");
++            if (config.parallelRandomTicks) subsystems.append(" random-ticks");
++            if (config.parallelEntityTicks) subsystems.append(" entity-ticks");
++            if (config.parallelScheduledBlockTicks) subsystems.append(" scheduled-block-ticks");
++            if (config.parallelScheduledFluidTicks) subsystems.append(" scheduled-fluid-ticks");
++            LOGGER.info(subsystems.toString());
++        } else {
++            LOGGER.info("Parallel processing is DISABLED - running as stock Paper");
++        }
++
++        return config;
++    }
++
++    /**
++     * Simple YAML reader - no dependency on external YAML libs.
++     * Handles flat and one-level nested keys only.
++     */
++    private void readFrom(Path path) throws IOException {
++        java.util.List<String> lines = Files.readAllLines(path);
++        String currentSection = null;
++
++        for (String rawLine : lines) {
++            // Strip comments
++            String line = rawLine;
++            int commentIdx = line.indexOf('#');
++            if (commentIdx >= 0 && (commentIdx == 0 || line.charAt(commentIdx - 1) == ' ')) {
++                line = line.substring(0, commentIdx);
++            }
++            line = line.stripTrailing();
++            if (line.isEmpty()) continue;
++
++            // Check indentation
++            String trimmed = line.stripLeading();
++            boolean indented = line.length() != trimmed.length();
++
++            int colonIdx = trimmed.indexOf(':');
++            if (colonIdx < 0) continue;
++
++            String key = trimmed.substring(0, colonIdx).strip();
++            String value = trimmed.substring(colonIdx + 1).strip();
++
++            if (value.isEmpty() && !indented) {
++                // Section header
++                currentSection = key;
++                continue;
++            }
++
++            String fullKey = indented && currentSection != null ? currentSection + "." + key : key;
++
++            switch (fullKey) {
++                case "enabled" -> this.enabled = parseBoolean(value, this.enabled);
++                case "threads" -> {
++                    if ("auto".equalsIgnoreCase(value)) {
++                        this.threadCount = -1;
++                    } else {
++                        try {
++                            int parsed = Integer.parseInt(value);
++                            this.threadCount = Math.max(1, parsed);
++                        } catch (NumberFormatException e) {
++                            this.threadCount = -1;
++                        }
++                    }
++                }
++                case "parallel.random-ticks" -> this.parallelRandomTicks = parseBoolean(value, this.parallelRandomTicks);
++                case "parallel.entity-ticks" -> this.parallelEntityTicks = parseBoolean(value, this.parallelEntityTicks);
++                case "parallel.scheduled-block-ticks" -> this.parallelScheduledBlockTicks = parseBoolean(value, this.parallelScheduledBlockTicks);
++                case "parallel.scheduled-fluid-ticks" -> this.parallelScheduledFluidTicks = parseBoolean(value, this.parallelScheduledFluidTicks);
++                case "log-level" -> {
++                    try {
++                        this.logLevel = LogLevel.valueOf(value.toUpperCase());
++                    } catch (IllegalArgumentException e) {
++                        this.logLevel = LogLevel.INFO;
++                    }
++                }
++                case "stats-interval" -> {
++                    try {
++                        this.statsInterval = Math.max(1, Integer.parseInt(value));
++                    } catch (NumberFormatException e) {
++                        this.statsInterval = 200;
++                    }
++                }
++            }
++        }
++    }
++
++    /**
++     * Write config to file with comments.
++     */
++    private void writeTo(Path path) throws IOException {
++        StringBuilder sb = new StringBuilder();
++        sb.append("# Mica - Parallel tick processing for Minecraft servers\n");
++        sb.append("\n");
++        sb.append("# Master switch - set to false to disable all parallel processing\n");
++        sb.append("# Server will behave identically to stock Paper\n");
++        sb.append("enabled: ").append(this.enabled).append("\n");
++        sb.append("\n");
++        sb.append("# Number of worker threads for parallel tick processing\n");
++        sb.append("# Default: auto (available processors - 2, minimum 2)\n");
++        sb.append("# Set to a specific number to override\n");
++        sb.append("threads: ").append(this.threadCount <= 0 ? "auto" : this.threadCount).append("\n");
++        sb.append("\n");
++        sb.append("# Per-subsystem toggles\n");
++        sb.append("# Disable individual subsystems if they cause issues\n");
++        sb.append("parallel:\n");
++        sb.append("  random-ticks: ").append(this.parallelRandomTicks).append("\n");
++        sb.append("  entity-ticks: ").append(this.parallelEntityTicks).append("\n");
++        sb.append("  scheduled-block-ticks: ").append(this.parallelScheduledBlockTicks).append("\n");
++        sb.append("  scheduled-fluid-ticks: ").append(this.parallelScheduledFluidTicks).append("\n");
++        sb.append("\n");
++        sb.append("# Logging level for Mica diagnostics\n");
++        sb.append("# OFF    - no Mica logging\n");
++        sb.append("# INFO   - periodic stats every stats-interval ticks (default)\n");
++        sb.append("# DEBUG  - per-collection logging, group details\n");
++        sb.append("# TRACE  - per-tick logging (very verbose, debugging only)\n");
++        sb.append("log-level: ").append(this.logLevel.name()).append("\n");
++        sb.append("\n");
++        sb.append("# Stats reporting interval in ticks (20 ticks = 1 second)\n");
++        sb.append("stats-interval: ").append(this.statsInterval).append("\n");
++
++        Files.writeString(path, sb.toString());
++    }
++
++    private static boolean parseBoolean(String value, boolean defaultValue) {
++        if ("true".equalsIgnoreCase(value)) return true;
++        if ("false".equalsIgnoreCase(value)) return false;
++        return defaultValue;
++    }
++}
+diff --git a/net/minecraft/world/level/chunk/LevelChunk.java b/net/minecraft/world/level/chunk/LevelChunk.java
+index 11ee1227edbda634f76cfbbb93144ecd2c3de74f..006ac53ba126f78db6f554eaabf6230f74ce30b9 100644
+--- a/net/minecraft/world/level/chunk/LevelChunk.java
++++ b/net/minecraft/world/level/chunk/LevelChunk.java
+@@ -456,15 +456,16 @@ public class LevelChunk extends ChunkAccess implements DebugValueSource, ca.spot
+                     blockState.affectNeighborsAfterRemoval(serverLevel, pos, flag1);
+                 }
+ 
++                if (!this.level.isClientSide() && (flags & Block.UPDATE_SKIP_ON_PLACE) == 0 && (!this.level.captureBlockStates || block instanceof net.minecraft.world.level.block.BaseEntityBlock)) { // CraftBukkit - Don't place while processing the BlockPlaceEvent, unless it's a BlockContainer. Prevents blocks such as TNT from activating when cancelled.
++                    state.onPlace(this.level, pos, blockState, flag1);
++                }
++
+                 // Mica start - Only run block verification during serial execution.
+                 if ( overlay != null && !section.getBlockState(i, i1, i2).is(block)) {
+                     return null;
+                 }
+                 // Mica end
+ 
+-                if (!this.level.isClientSide() && (flags & Block.UPDATE_SKIP_ON_PLACE) == 0 && (!this.level.captureBlockStates || block instanceof net.minecraft.world.level.block.BaseEntityBlock)) { // CraftBukkit - Don't place while processing the BlockPlaceEvent, unless it's a BlockContainer. Prevents blocks such as TNT from activating when cancelled.
+-                    state.onPlace(this.level, pos, blockState, flag1);
+-                }
+ 
+                 if (state.hasBlockEntity()) {
+                     BlockEntity blockEntity = this.getBlockEntity(pos, LevelChunk.EntityCreationType.CHECK);
+diff --git a/net/minecraft/world/ticks/LevelTicks.java b/net/minecraft/world/ticks/LevelTicks.java
+index 59c52e44373795b92b2e16e37b4e4a6bdff46e1a..abc158313f63551c1723d78c4b5b0b8dd8a95fbc 100644
+--- a/net/minecraft/world/ticks/LevelTicks.java
++++ b/net/minecraft/world/ticks/LevelTicks.java
+@@ -79,7 +79,6 @@ public class LevelTicks<T> implements LevelTickAccess<T> {
+         }
+         // Mica end
+ 
+-
+         long packedChunkPos = ChunkPos.asLong(tick.pos());
+         LevelChunkTicks<T> levelChunkTicks = this.allContainers.get(packedChunkPos);
+         if (levelChunkTicks == null) {

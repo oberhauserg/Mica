@@ -30,7 +30,7 @@ public record ServerBuildInfoImpl(
     private static final String ATTRIBUTE_GIT_BRANCH = "Git-Branch";
     private static final String ATTRIBUTE_GIT_COMMIT = "Git-Commit";
 
-    private static final String BRAND_PAPER_NAME = "Paper";
+    private static final String BRAND_PAPER_NAME = "Mica";
 
     private static final String BUILD_DEV = "DEV";
 
@@ -61,7 +61,7 @@ public record ServerBuildInfoImpl(
 
     @Override
     public boolean isBrandCompatible(final @NotNull Key brandId) {
-        return brandId.equals(this.brandId);
+        return brandId.equals(this.brandId) || brandId.equals(BRAND_PAPER_ID);
     }
 
     @Override

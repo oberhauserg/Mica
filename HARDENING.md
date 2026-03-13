@@ -21,58 +21,46 @@ neighborChanged, cascades) runs naturally above it. Only unsafe operations are s
 
 ### 1. AsyncCatcher bypass
 **File:** `AsyncCatcher.java`
-
 **Current fix:** Blanket bypass for all ForkJoinWorkerThread calls.
-
 **Proper fix:** Categorize each call site — only bypass operations explicitly
 determined safe during parallel execution.
 
 ### 2. Bukkit event deferral and cancellation
 **File:** `PaperEventManager.java`
-
 **Current fix:** All sync events from ForkJoinWorkerThreads are buffered to DeferredEffects.
-
 **Problem:** Cancellable events (BlockRedstoneEvent, BlockSpreadEvent) return immediately
 without plugin processing. Plugins cannot cancel block changes during parallel execution.
-
 **Severity:** Medium — plugins that cancel redstone/growth events will be ignored.
-
 **Proper fix:** Either run cancellable events synchronously (defeating parallelism for
 that operation) or implement speculative execution with deferred commit.
 
 ### 3. Entity spawns from parallel threads
 **File:** `ServerLevel.addEntity()`
-
 **Current fix:** Buffer in DeferredEffects, apply after parallel phase.
-
+**Known issue:** UUID collisions observed — two falling gravel entities on different
+threads received the same UUID via `Mth.createInsecureUUID()` which uses a shared
+non-thread-safe random. Second entity silently dropped.
+**Fix needed:** Use `UUID.randomUUID()` during parallel phase, or use per-thread random.
 **Remaining concerns:**
-- Entity UUID uniqueness across threads
 - Entity position validity when deferred spawn executes
 - Spawn reason correctness for all code paths
 
 ### 4. Network packet sending from worker threads
 **Files:** `ServerLevel.broadcastEntityEvent()`, `broadcastDamageEvent()`,
 `playSound()`, `sendParticles()`, `levelEvent()`, `gameEvent()`
-
 **Current fix:** `sendBlockUpdated` and `setBlocksDirty` suppressed in
 `notifyAndUpdatePhysics` during parallel phase. Other packet-sending methods
 are NOT suppressed.
-
 **Risk:** Iterating player tracking lists concurrently with main thread
 modifications could cause ConcurrentModificationException.
-
 **Severity:** Low crash risk, moderate data race risk.
-
 **Proper fix:** Buffer all outbound packets in DeferredEffects during parallel
 phase and flush on main thread.
 
 ### 5. Profiler thread safety
 **File:** Various — `Profiler.get()` used throughout tick code.
-
 **Current fix:** None.
-
 **Risk:** Profiler accumulates stats in non-thread-safe data structures.
-
 **Proper fix:** Disable profiler during parallel phases or use thread-local instances.
 
 ---
@@ -81,9 +69,11 @@ phase and flush on main thread.
 
 ### 6. Transparent overlay at LevelChunk.setBlockState (CURRENT)
 **Files:** `LevelChunk.setBlockState()`, `Level.notifyAndUpdatePhysics()`
-
 **Approach:** Intercept at chunk level. All vanilla game logic runs naturally above it.
-Suppressed during parallel phase:
+**Critical ordering:** `onPlace` must execute BEFORE the overlay verification early-return.
+Previously, the overlay check returned null before `onPlace`, which prevented
+`LiquidBlock.onPlace()` from scheduling continuation ticks — breaking water/lava flow.
+**Suppressed during parallel phase:**
 - `sendBlockUpdated` (packets)
 - `setBlocksDirty` (rendering)
 - `BlockPhysicsEvent` (Bukkit events)
@@ -95,38 +85,30 @@ Suppressed during parallel phase:
 ### 7. Alternate Current per-thread WireHandler
 **Files:** `Level.java` (micaWireHandler ThreadLocal), `ServerLevel.getWireHandler()`,
 `LevelHelper.setWireState()`
-
 **Current fix:** Per-thread WireHandler instances during parallel dispatch.
 Each thread gets its own node cache, search queue, and `updating` flag.
-
 **Note:** `LevelHelper.setWireState` bypasses `LevelChunk.setBlockState` — writes
 directly to section palette. Overlay intercept in `LevelHelper` is still required.
 Shape updates suppressed in the LevelHelper overlay path to prevent recursive chain spawning.
 
 ### 8. Vanilla redstone evaluator — FIXED
 **Files:** `RedStoneWireBlock.java`, `RedstoneWireTurbo.java`
-
 **Root cause:** `shouldSignal` was a shared boolean field. Cross-thread reads during
 `getBlockSignal()` caused incorrect power levels and infinite oscillation.
-
 **Fix:** Changed `shouldSignal` to `ThreadLocal<Boolean>`. All three redstone
 implementations now work: VANILLA, EIGENCRAFT, ALTERNATE_CURRENT.
 
 ### 9. Per-thread neighbor updater
 **Files:** `Level.java` (micaNeighborUpdater ThreadLocal), `ServerLevel.java`,
 `Level.neighborShapeChanged()`
-
 **Current fix:** `CollectingNeighborUpdater` created per-thread during parallel dispatch.
 All `neighborChanged`, `shapeUpdate`, `updateNeighborsAt`, `neighborShapeChanged` calls
 intercepted to route through per-thread instance.
 
 ### 10. Block entity state not snapshotted
 **Current:** `TrackedOverlay.getBlockEntity()` falls through to live world.
-
 **Risk:** Parallel tick reading a hopper's inventory while another thread modifies it.
-
 **For random/entity ticks:** Low risk.
-
 **For block entity ticking (future):** Must snapshot or synchronize.
 
 ---
@@ -135,23 +117,18 @@ intercepted to route through per-thread instance.
 
 ### 11. Entity position snapshots
 **File:** `Entity.java`
-
 **Current fix:** Snapshot position, bounding box, blockPosition, and inBlockState
 before parallel entity dispatch. Cross-entity reads return snapshot values.
 Self-entity reads return live values.
-
 **Methods intercepted:** `getX()`, `getY()`, `getZ()`, `position()`, `getBoundingBox()`,
 `blockPosition()`, `getBlockX/Y/Z()`, `getX/Y/Z(scale)`, `getEyeY()`, `getInBlockState()`
-
 **Overhead:** ~5ns per cross-entity read (one field check + ThreadLocal.get()).
 
 ### 12. Entity chunk movement and removal deferral
 **File:** `EntityLookup.java` (onMove and onRemove in EntityCallback)
-
 **Current fix:** Both chunk slice moves AND entity removals are deferred to main thread
 during parallel entity ticks. If deferred move fails due to stale chunk data, silently
 catch and let next tick correct.
-
 **Known behavioral effects (self-correct within 1-2 ticks):**
 - Entity may be invisible to players briefly when crossing chunk boundaries
 - Entity sensing/targeting may briefly miss entities with stale chunk assignments
@@ -162,18 +139,14 @@ catch and let next tick correct.
 
 ### 13. ChunkMap.newTrackerTick null chunk data
 **File:** `ChunkMap.java`
-
 **Current fix:** Null check on `moonrise$getChunkData()` — skip entity if null.
-
 **Root cause:** Deferred entity chunk moves leave entities with null chunk data
 until the deferred move applies.
 
 ### 14. TickThread.micaParallelPhase bypass
 **File:** `TickThread.java`
-
 **Current fix:** ThreadLocal boolean flag added to `isTickThread()` so Mica worker
 threads pass tick thread checks.
-
 **Risk:** May mask real thread-safety issues in code paths we haven't audited.
 
 ---
@@ -182,16 +155,13 @@ threads pass tick thread checks.
 
 ### 15. Tick collection and willTickThisTick — FIXED
 **File:** `LevelTicks.java`
-
 **Root cause:** `collectForParallelDispatch` drained `toRunThisTick` before `toRunThisTickSet`
 was populated. `willTickThisTick` always returned false, allowing duplicate tick scheduling.
-
 **Fix:** Call `calculateTickSetIfNeeded()` eagerly before draining. Added `markTickExecuted()`
 for per-tick removal during serial execution, matching vanilla's exact behavior.
 
 ### 16. Deferred scheduleTick
 **File:** `LevelTicks.schedule()`
-
 **Current fix:** `scheduleTick` calls during parallel phase are buffered in DeferredEffects,
 tagged with the source OperationId. Replayed after merge for clean operations only.
 Tainted operations' deferred ticks are discarded (serial re-run produces them directly).
@@ -199,17 +169,14 @@ Tainted operations' deferred ticks are discarded (serial re-run produces them di
 ### 17. Same-tick cascade drain
 **Current fix:** After replaying deferred scheduled ticks on the clean path, drain any
 ticks due for the current game tick in a loop until stable.
-
 **Risk:** Edge cases in nested same-tick cascades.
 
 ### 18. Cascade conflict detection and merge optimization
 **Files:** `TrackedOverlay.java`, `OverlayMerger.java`
-
 **Cascade detection:** Positions read during a cascade triggered by a write are marked as
 "touched." During merge, touched positions are treated as write-equivalent for
 conflict detection — if another thread read a touched position, both operations
 are tainted.
-
 **Merge optimization:** Pre-built `Long2ObjectMap<List<OperationId>>` position→readers
 index replaces repeated scans of `getOperationReads()`. Operation→written positions
 index enables O(1) BFS walks. Merge time reduced from 1.68ms (86% of scheduled tick
@@ -217,16 +184,12 @@ time) to 0.23% of tick time — over 7x improvement.
 
 ### 19. Independent tick grouping (TickGrouper) — OPTIMIZED
 **File:** `TickGrouper.java`
-
 **Approach:** After merge, ticks are grouped into connected components via Union-Find
 based on position overlap (writes, reads, touched). Components with conflicts are
 re-run — potentially in parallel with each other since they share no positions.
-
 **Performance:** Pre-built `Map<OperationId, LongOpenHashSet>` position index replaces
 flat list scanning. Grouping is now O(total_positions) instead of O(ticks × total_reads).
-
 **Fast path:** Skip grouper entirely when taintedOperations is empty (99%+ of game ticks).
-
 **Parallel tainted re-run:** Multiple independent tainted groups dispatch to the ForkJoinPool,
 each with its own overlay, neighbor updater, and wire handler. Overlays merge after
 completion (guaranteed conflict-free since groups share no positions by construction).
@@ -236,9 +199,7 @@ Single tainted group runs serially on main thread to avoid dispatch overhead.
 **Status:** Mostly resolved. The `willTickThisTick` fix (item 15) eliminated the primary
 cause of redstone flicker. Remaining minor flicker when tainted groups re-run serially
 is due to individual block update packets sent mid-cascade.
-
 **Severity:** Visual only — game state is correct.
-
 **Proper fix:** Buffer all block update packets during scheduled tick phase and
 flush atomically at the end.
 
@@ -248,14 +209,11 @@ flush atomically at the end.
 
 ### 21. POI updates
 **File:** `Level.notifyAndUpdatePhysics()` (suppressed during parallel)
-
 **Current fix:** Suppressed during parallel phase. Applied when writes commit.
-
 **Risk:** Villager AI may path to destroyed POI for 1 tick. Self-corrects.
 
 ### 22. Block entity create/remove
 **File:** `LevelChunk.setBlockState()` (Mica intercept)
-
 **Current fix:** Deferred to main thread via DeferredEffects.
 
 ### 23. Heightmap and lighting updates
@@ -264,7 +222,7 @@ Applied when final writes commit to the live world.
 
 ---
 
-## Performance Data (Pending Formal Benchmarking)
+## Performance Data
 
 | Subsystem | Entities/Operations | Threads | Time | vs Serial |
 |---|---|---|---|---|
@@ -308,8 +266,17 @@ Applied when final writes commit to the live world.
 - [x] Multiple players in same area — 4 bots clustered at 5-block spacing, 5 min, zero conflicts
 - [x] 10 simultaneous players, 2700+ chunks, 750 entities, zero exceptions
 - [x] 4-bit full adder carry chain propagation — verified 5+3=8
+- [x] Water flow with onPlace fix — downward and lateral flow correct
 - [ ] Large redstone machines (100+ ticks per game tick)
 - [ ] 2,000+ entities sustained without crashes (long duration)
+- [ ] Lava flow (slower tick rate than water, same pipeline)
+
+### Benchmarks (Mica vs Stock Paper)
+- [ ] Chunky pre-render: compare TPS during world generation (e.g. 1000 chunk radius)
+- [ ] Chunky pre-render: compare total generation time
+- [ ] Entity scaling: spawn villagers in increments of 500, compare MSPT at each step
+- [ ] Redstone: large piston door or sorting system, compare MSPT
+- [ ] Spark profile comparison: same workload on Mica vs Paper, compare flame graphs
 
 ### Edge Cases
 - [ ] Server shutdown during parallel phase

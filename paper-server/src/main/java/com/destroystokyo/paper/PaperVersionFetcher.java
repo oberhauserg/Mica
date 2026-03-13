@@ -40,10 +40,10 @@ public class PaperVersionFetcher implements VersionFetcher {
     private static final ComponentLogger COMPONENT_LOGGER = ComponentLogger.logger(LogManager.getRootLogger().getName());
     private static final int DISTANCE_ERROR = -1;
     private static final int DISTANCE_UNKNOWN = -2;
-    private static final String DOWNLOAD_PAGE = "https://papermc.io/downloads/paper";
-    private static final String REPOSITORY = "PaperMC/Paper";
+    private static final String DOWNLOAD_PAGE = "https://github.com/oberhauserg/Mica/releases";
+    private static final String REPOSITORY = "oberhauserg/Mica";
     private static final ServerBuildInfo BUILD_INFO = ServerBuildInfo.buildInfo();
-    private static final String USER_AGENT = BUILD_INFO.brandName() + "/" + BUILD_INFO.asString(VERSION_SIMPLE) + " (https://papermc.io)";
+    private static final String USER_AGENT = BUILD_INFO.brandName() + "/" + BUILD_INFO.asString(VERSION_SIMPLE) + " (https://github.com/oberhauserg/Mica)";
     private static final Gson GSON = new Gson();
 
     @Override
